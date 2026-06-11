@@ -109,6 +109,35 @@ router.get('/tasks/:taskId', async (req: Request, res: Response) => {
   }
 });
 
+router.patch('/tasks/:taskId', async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const { priority, timeout, maxRetries, tags, scheduledFor } = req.body;
+
+    const updated = await TaskQueue.updateTaskFields(taskId, {
+      priority,
+      timeout,
+      maxRetries,
+      tags,
+      scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
+    });
+
+    res.json(updated);
+  } catch (error: any) {
+    if (error.message?.includes('not found')) {
+      return res.status(404).json({ error: error.message });
+    }
+    if (error.message?.includes('cannot be modified')) {
+      return res.status(409).json({ error: error.message });
+    }
+    if (error.message?.includes('must be')) {
+      return res.status(400).json({ error: error.message });
+    }
+    logger.error({ error }, 'Update task error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get('/queues/:queueName/tasks', async (req: Request, res: Response) => {
   try {
     const { queueName } = req.params;

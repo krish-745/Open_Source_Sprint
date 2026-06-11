@@ -136,6 +136,77 @@ export class TaskQueue {
   }
 
   /**
+   * Modify a not-yet-executed task's parameters.
+   *
+   * Only the whitelisted fields (`priority`, `timeout`, `maxRetries`, `tags`,
+   * `scheduledFor`) may be changed, and only while the task has not started
+   * (status pending/queued/blocked). An audit entry is appended to the task's
+   * metadata for every change. Returns the updated task; throws if the task is
+   * missing or already executing/finished.
+   */
+  static async updateTaskFields(
+    taskId: string,
+    fields: {
+      priority?: 'low' | 'medium' | 'high' | 'critical';
+      timeout?: number;
+      maxRetries?: number;
+      tags?: string[];
+      scheduledFor?: Date;
+    }
+  ): Promise<Task> {
+    const client = getRedisClient();
+    const task = await this.getTask(taskId);
+
+    if (!task) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+
+    const modifiable = ['pending', 'queued', 'blocked'];
+    if (!modifiable.includes(task.status)) {
+      throw new Error(`Task ${taskId} cannot be modified in status '${task.status}'`);
+    }
+
+    if (fields.timeout !== undefined && fields.timeout <= 0) {
+      throw new Error('timeout must be positive');
+    }
+    if (fields.maxRetries !== undefined && fields.maxRetries < 0) {
+      throw new Error('maxRetries must be non-negative');
+    }
+
+    const changes: Record<string, { from: any; to: any }> = {};
+    const apply = <K extends keyof Task>(key: K, value: Task[K] | undefined) => {
+      if (value !== undefined && task[key] !== value) {
+        changes[key as string] = { from: task[key], to: value };
+        task[key] = value;
+      }
+    };
+
+    apply('priority', fields.priority);
+    apply('timeout', fields.timeout);
+    apply('maxRetries', fields.maxRetries);
+    apply('tags', fields.tags);
+    apply('scheduledFor', fields.scheduledFor);
+
+    if (Object.keys(changes).length > 0) {
+      const audit = (task.metadata.auditLog as any[]) || [];
+      audit.push({ at: new Date().toISOString(), changes });
+      task.metadata.auditLog = audit;
+
+      await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+      // Re-score the queue entry if priority changed.
+      if (changes.priority) {
+        const queueKey = `${QUEUE_PREFIX}${task.queue}`;
+        await client.zAdd(queueKey, { score: this._calculateQueueScore(task.priority), value: taskId });
+      }
+
+      logger.info({ taskId, changed: Object.keys(changes) }, 'Task fields updated');
+    }
+
+    return task;
+  }
+
+  /**
    * Update task status
    */
   static async updateTaskStatus(taskId: string, status: TaskStatus, metadata?: Record<string, any>): Promise<void> {
