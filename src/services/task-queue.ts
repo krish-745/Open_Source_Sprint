@@ -91,6 +91,7 @@ export class TaskQueue {
       throw new Error(`Task ${taskId} not found`);
     }
 
+    const oldStatus = task.status;
     task.status = status;
     if (metadata) {
       Object.assign(task, metadata);
@@ -103,6 +104,10 @@ export class TaskQueue {
     }
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+    // Update queue stats
+    await this._transitionStats(task.queue, oldStatus, status);
+
     logger.info({ taskId, status }, 'Task status updated');
   }
 
@@ -152,11 +157,15 @@ export class TaskQueue {
       return false;
     }
 
+    const oldStatus = task.status;
     task.retries += 1;
     task.status = 'retry';
     task.error = undefined;
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+    // Update queue stats
+    await this._transitionStats(task.queue, oldStatus, 'retry');
 
     const queueKey = `${QUEUE_PREFIX}${task.queue}`;
     const score = this._calculateQueueScore(task.priority);
@@ -255,9 +264,14 @@ export class TaskQueue {
     const task = await this.getTask(taskId);
 
     if (task) {
+      const oldStatus = task.status;
       task.status = 'failed';
       await client.lPush(DEAD_LETTER_QUEUE, JSON.stringify(task));
       await client.del(`${TASK_PREFIX}${taskId}`);
+
+      // Update queue stats
+      await this._transitionStats(task.queue, oldStatus, 'failed');
+
       logger.warn({ taskId }, 'Task moved to DLQ');
     }
   }
@@ -266,5 +280,34 @@ export class TaskQueue {
     const client = getRedisClient();
     const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
     await client.hIncrBy(statsKey, 'pending', increment);
+  }
+
+  private static async _transitionStats(
+    queueName: string,
+    oldStatus: TaskStatus,
+    newStatus: TaskStatus
+  ): Promise<void> {
+    const client = getRedisClient();
+    const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
+
+    const getField = (status: TaskStatus): string | null => {
+      if (status === 'pending') return 'pending';
+      if (status === 'processing') return 'processing';
+      if (status === 'completed') return 'completed';
+      if (status === 'failed') return 'failed';
+      return null;
+    };
+
+    const oldField = getField(oldStatus);
+    const newField = getField(newStatus);
+
+    if (oldField === newField) return;
+
+    if (oldField) {
+      await client.hIncrBy(statsKey, oldField, -1);
+    }
+    if (newField) {
+      await client.hIncrBy(statsKey, newField, 1);
+    }
   }
 }
