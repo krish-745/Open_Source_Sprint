@@ -12,6 +12,10 @@ jest.mock('../redis', () => {
     del: jest.fn(),
     sAdd: jest.fn(),
     sMembers: jest.fn(),
+    sRem: jest.fn(),
+    zRem: jest.fn(),
+    sIsMember: jest.fn(),
+    zRange: jest.fn(),
   };
   return { getRedisClient: jest.fn(() => mClient) };
 });
@@ -170,6 +174,91 @@ describe('TaskQueue', () => {
       redisClient.sMembers.mockResolvedValue([]);
       const status = await TaskQueue.getGroupStatus('g-nonexistent');
       expect(status).toBeNull();
+    });
+  });
+
+  describe('Secondary Indexing and Optimization', () => {
+    it('should index tasks by status and creation time when created', async () => {
+      redisClient.zCard.mockResolvedValue(0);
+      redisClient.zAdd.mockResolvedValue(1);
+      redisClient.sAdd.mockResolvedValue(1);
+
+      const task = await TaskQueue.createTask('test-task', 'test-handler', {});
+
+      expect(redisClient.zAdd).toHaveBeenCalledWith('tasks:created_at', expect.objectContaining({
+        score: expect.any(Number),
+        value: task.id
+      }));
+      expect(redisClient.sAdd).toHaveBeenCalledWith('tasks:status:pending', task.id);
+      expect(redisClient.sAdd).toHaveBeenCalledWith(`tasks:queue:${task.queue}:status:pending`, task.id);
+    });
+
+    it('should transition status indexes when task status updates', async () => {
+      const mockTask = {
+        id: 'task-idx-1',
+        name: 'transition-test',
+        status: 'pending',
+        queue: 'default',
+      };
+      redisClient.get.mockResolvedValue(JSON.stringify(mockTask));
+      redisClient.sRem.mockResolvedValue(1);
+      redisClient.sAdd.mockResolvedValue(1);
+
+      await TaskQueue.updateTaskStatus('task-idx-1', 'processing');
+
+      expect(redisClient.sRem).toHaveBeenCalledWith('tasks:status:pending', 'task-idx-1');
+      expect(redisClient.sAdd).toHaveBeenCalledWith('tasks:status:processing', 'task-idx-1');
+      expect(redisClient.sRem).toHaveBeenCalledWith('tasks:queue:default:status:pending', 'task-idx-1');
+      expect(redisClient.sAdd).toHaveBeenCalledWith('tasks:queue:default:status:processing', 'task-idx-1');
+    });
+
+    it('should query creation index and check status sets for cleanupOldTasks', async () => {
+      // Setup candidate task IDs
+      redisClient.zRange.mockResolvedValue(['t-old-completed', 't-old-pending', 't-old-failed']);
+      
+      // Mock sIsMember to identify status
+      redisClient.sIsMember.mockImplementation(async (key: string, member: string) => {
+        if (key === 'tasks:status:completed' && member === 't-old-completed') return true;
+        if (key === 'tasks:status:failed' && member === 't-old-failed') return true;
+        return false;
+      });
+
+      // Mock getTask to return the task structures
+      redisClient.get.mockImplementation(async (key: string) => {
+        if (key === 'task:t-old-completed') {
+          return JSON.stringify({ id: 't-old-completed', queue: 'default', status: 'completed' });
+        }
+        if (key === 'task:t-old-failed') {
+          return JSON.stringify({ id: 't-old-failed', queue: 'default', status: 'failed' });
+        }
+        return null;
+      });
+
+      redisClient.del.mockResolvedValue(1);
+      redisClient.sRem.mockResolvedValue(1);
+      redisClient.zRem.mockResolvedValue(1);
+
+      const deletedCount = await TaskQueue.cleanupOldTasks(2);
+
+      // Verify the score-based query was made on the creation index
+      expect(redisClient.zRange).toHaveBeenCalledWith('tasks:created_at', 0, expect.any(Number), { BY: 'SCORE' });
+
+      // Verify status checks were made
+      expect(redisClient.sIsMember).toHaveBeenCalledWith('tasks:status:completed', 't-old-completed');
+      expect(redisClient.sIsMember).toHaveBeenCalledWith('tasks:status:failed', 't-old-completed');
+      expect(redisClient.sIsMember).toHaveBeenCalledWith('tasks:status:completed', 't-old-pending');
+      
+      // Completed and failed tasks should be deleted
+      expect(redisClient.del).toHaveBeenCalledWith('task:t-old-completed');
+      expect(redisClient.del).toHaveBeenCalledWith('task:t-old-failed');
+      expect(redisClient.del).not.toHaveBeenCalledWith('task:t-old-pending');
+
+      // Index cleanup
+      expect(redisClient.sRem).toHaveBeenCalledWith('tasks:status:completed', 't-old-completed');
+      expect(redisClient.zRem).toHaveBeenCalledWith('tasks:created_at', 't-old-completed');
+      expect(redisClient.zRem).toHaveBeenCalledWith('tasks:index', 't-old-completed');
+
+      expect(deletedCount).toBe(2);
     });
   });
 });

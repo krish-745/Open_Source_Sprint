@@ -37,6 +37,8 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
       hIncrBy,
+      sAdd: jest.fn(),
+      sRem: jest.fn(),
     };
     mockedGetRedisClient.mockReturnValue(mockClient as any);
 
@@ -53,6 +55,8 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
       hIncrBy,
+      sAdd: jest.fn(),
+      sRem: jest.fn(),
     };
     mockedGetRedisClient.mockReturnValue(mockClient as any);
 

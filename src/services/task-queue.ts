@@ -80,6 +80,15 @@ export class TaskQueue {
     // Add to task index
     await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
 
+    // Add to creation time index
+    await client.zAdd('tasks:created_at', { score: task.createdAt.getTime(), value: taskId });
+
+    // Add to status index
+    await client.sAdd('tasks:status:pending', taskId);
+
+    // Add to queue + status index
+    await client.sAdd(`tasks:queue:${queueName}:status:pending`, taskId);
+
     // Add to group index if groupId is provided
     if (options.groupId) {
       await client.sAdd(`group:${options.groupId}:tasks`, taskId);
@@ -260,6 +269,7 @@ export class TaskQueue {
     // Keep queue stats consistent as the task moves between states.
     if (previousStatus !== status) {
       await this._transitionQueueStats(task.queue, previousStatus, status);
+      await this._transitionStatusIndexes(taskId, task.queue, previousStatus, status);
     }
 
     logger.info({ taskId, status }, 'Task status updated');
@@ -320,11 +330,17 @@ export class TaskQueue {
       return false;
     }
 
+    const previousStatus = task.status;
     task.retries += 1;
     task.status = 'retry';
     delete task.error;
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+    // Update index sets
+    if (previousStatus !== 'retry') {
+      await this._transitionStatusIndexes(taskId, task.queue, previousStatus, 'retry');
+    }
 
     const queueKey = `${QUEUE_PREFIX}${task.queue}`;
     const score = this._calculateQueueScore(task.priority);
@@ -380,15 +396,21 @@ export class TaskQueue {
     const client = getRedisClient();
     const cutoffTime = Date.now() - hoursAgo * 60 * 60 * 1000;
 
-    const allTaskIds = await client.zRange(TASK_INDEX_KEY, cutoffTime, 0, { BY: 'SCORE', REV: true });
+    const candidateIds = await client.zRange('tasks:created_at', 0, cutoffTime, { BY: 'SCORE' });
     let deleted = 0;
 
-    for (const taskId of allTaskIds) {
-      const task = await this.getTask(taskId);
-      if (task && (task.status === 'completed' || task.status === 'failed')) {
-        await client.del(`${TASK_PREFIX}${taskId}`);
-        await client.zRem(TASK_INDEX_KEY, taskId);
-        deleted++;
+    for (const taskId of candidateIds) {
+      const isCompleted = await client.sIsMember('tasks:status:completed', taskId);
+      const isFailed = await client.sIsMember('tasks:status:failed', taskId);
+
+      if (isCompleted || isFailed) {
+        const task = await this.getTask(taskId);
+        if (task) {
+          await client.del(`${TASK_PREFIX}${taskId}`);
+          await this._removeStatusIndexes(taskId, task.queue, task.status);
+          await client.zRem(TASK_INDEX_KEY, taskId);
+          deleted++;
+        }
       }
     }
 
@@ -406,7 +428,7 @@ export class TaskQueue {
    */
   static async recoverStaleTasks(staleMs: number = 5 * 60 * 1000): Promise<number> {
     const client = getRedisClient();
-    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+    const taskIds = await client.sMembers('tasks:status:processing');
     const now = Date.now();
     let recovered = 0;
 
@@ -425,6 +447,8 @@ export class TaskQueue {
       task.status = 'queued';
       task.workerId = undefined;
       await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+      await this._transitionStatusIndexes(taskId, task.queue, 'processing', 'queued');
+      await this._transitionQueueStats(task.queue, 'processing', 'queued');
 
       const queueKey = `${QUEUE_PREFIX}${task.queue}`;
       const score = this._calculateQueueScore(task.priority);
@@ -470,9 +494,11 @@ export class TaskQueue {
     const task = await this.getTask(taskId);
 
     if (task) {
+      const originalStatus = task.status;
       task.status = 'failed';
       await client.lPush(DEAD_LETTER_QUEUE, JSON.stringify(task));
       await client.del(`${TASK_PREFIX}${taskId}`);
+      await this._removeStatusIndexes(taskId, task.queue, originalStatus);
       logger.warn({ taskId }, 'Task moved to DLQ');
     }
   }
@@ -510,5 +536,29 @@ export class TaskQueue {
     if (this.STATS_BUCKETS.includes(to)) {
       await client.hIncrBy(statsKey, to, 1);
     }
+  }
+
+  private static async _transitionStatusIndexes(
+    taskId: string,
+    queue: string,
+    from: TaskStatus,
+    to: TaskStatus
+  ): Promise<void> {
+    const client = getRedisClient();
+    await client.sRem(`tasks:status:${from}`, taskId);
+    await client.sAdd(`tasks:status:${to}`, taskId);
+    await client.sRem(`tasks:queue:${queue}:status:${from}`, taskId);
+    await client.sAdd(`tasks:queue:${queue}:status:${to}`, taskId);
+  }
+
+  private static async _removeStatusIndexes(
+    taskId: string,
+    queue: string,
+    status: TaskStatus
+  ): Promise<void> {
+    const client = getRedisClient();
+    await client.sRem(`tasks:status:${status}`, taskId);
+    await client.sRem(`tasks:queue:${queue}:status:${status}`, taskId);
+    await client.zRem('tasks:created_at', taskId);
   }
 }
