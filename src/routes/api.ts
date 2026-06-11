@@ -32,7 +32,11 @@ router.post('/tasks', async (req: Request, res: Response) => {
       return res.status(400).json({ error: `Unknown handler: ${handler}` });
     }
 
-    const task = await TaskQueue.createTask(name, handler, payload || {}, {
+    if (payload !== undefined && payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) {
+      return res.status(400).json({ error: 'Payload must be a valid object' });
+    }
+
+    const task = await TaskQueue.createTask(name, handler, payload, {
       queueName,
       priority,
       maxRetries,
