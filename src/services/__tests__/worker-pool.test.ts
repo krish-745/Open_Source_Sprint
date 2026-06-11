@@ -67,6 +67,18 @@ function makeFakeRedis() {
       if (i >= 0) l.splice(i, 1);
       return 1;
     }),
+    hSet: jest.fn(async (k: string, f: string, v: string) => {
+      strings.set(`${k}:${f}`, v);
+      return 1;
+    }),
+    hGet: jest.fn(async (k: string, f: string) => strings.get(`${k}:${f}`) ?? null),
+    hIncrBy: jest.fn(async (k: string, f: string, i: number) => {
+      const v = parseInt(strings.get(`${k}:${f}`) || '0') + i;
+      strings.set(`${k}:${f}`, v.toString());
+      return v;
+    }),
+    zCard: jest.fn(async (k: string) => zsets.get(k)?.size ?? 0),
+    eval: jest.fn(async () => 1),
     __strings: strings,
   } as any;
 }
