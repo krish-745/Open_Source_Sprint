@@ -123,6 +123,9 @@ export class TaskScheduler {
           }
         }
 
+        // Recover tasks orphaned by crashed workers while holding the lock.
+        await TaskQueue.recoverStaleTasks();
+
         // Release lock
         const currentLock = await client.get(lockKey);
         if (currentLock === lockId) {

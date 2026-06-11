@@ -9,6 +9,17 @@ const QUEUE_LIST_KEY = 'queues:all';
 const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
 
+/**
+ * Thrown when a queue has reached its maximum capacity (backpressure).
+ * The API layer maps this to HTTP 429 Too Many Requests.
+ */
+export class QueueFullError extends Error {
+  constructor(queueName: string, maxSize: number) {
+    super(`Queue ${queueName} exceeds maximum size of ${maxSize}`);
+    this.name = 'QueueFullError';
+  }
+}
+
 export class TaskQueue {
   /**
    * Create a new task and add it to the queue.
@@ -40,6 +51,13 @@ export class TaskQueue {
 
     const finalPayload = payload || {};
 
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const maxQueueSize = parseInt(process.env.MAX_QUEUE_SIZE || '10000', 10);
+    const currentSize = await client.zCard(queueKey);
+
+    if (currentSize >= maxQueueSize) {
+      throw new QueueFullError(queueName, maxQueueSize);
+    }
     const task: Task = {
       id: taskId,
       name,
@@ -67,7 +85,6 @@ export class TaskQueue {
     await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
 
     // Add to queue
-    const queueKey = `${QUEUE_PREFIX}${queueName}`;
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
 
@@ -76,6 +93,43 @@ export class TaskQueue {
 
     logger.info({ taskId, queueName }, 'Task created');
     return task;
+  }
+
+  /**
+   * Create multiple tasks in one call.
+   *
+   * Validates every input up front (non-empty, within the 1000-task limit, each
+   * with a name and handler) so the batch is rejected before anything is
+   * written if any entry is invalid. Returns the created tasks in order.
+   */
+  static async createTasksBatch(
+    inputs: Array<{
+      name: string;
+      handler: string;
+      payload?: Record<string, any>;
+      options?: Parameters<typeof TaskQueue.createTask>[3];
+    }>
+  ): Promise<Task[]> {
+    if (inputs.length === 0) {
+      throw new Error('Batch must contain at least one task');
+    }
+    if (inputs.length > 1000) {
+      throw new Error('Batch size exceeds the maximum of 1000 tasks');
+    }
+
+    inputs.forEach((input, index) => {
+      if (!input.name || !input.handler) {
+        throw new Error(`Invalid task at index ${index}: name and handler are required`);
+      }
+    });
+
+    const created: Task[] = [];
+    for (const input of inputs) {
+      created.push(await this.createTask(input.name, input.handler, input.payload || {}, input.options || {}));
+    }
+
+    logger.info({ count: created.length }, 'Batch of tasks created');
+    return created;
   }
 
   /**
@@ -98,6 +152,8 @@ export class TaskQueue {
       throw new Error(`Task ${taskId} not found`);
     }
 
+    const previousStatus = task.status;
+
     task.status = status;
     if (metadata) {
       Object.assign(task, metadata);
@@ -110,17 +166,32 @@ export class TaskQueue {
     }
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+    // Keep queue stats consistent as the task moves between states.
+    if (previousStatus !== status) {
+      await this._transitionQueueStats(task.queue, previousStatus, status);
+    }
+
     logger.info({ taskId, status }, 'Task status updated');
   }
 
   /**
-   * Get next task from queue (considering priority and dependencies)
+   * Get next task from queue.
+   *
+   * Priority semantics: tasks are ordered by a priority-derived score
+   * (critical > high > medium > low) in the queue sorted set, and this returns
+   * the highest-priority task that is actually runnable (dependencies met and
+   * not scheduled for the future). The full queue is scanned in priority order
+   * rather than only the top N, so a runnable high-priority task is never
+   * skipped because lower-priority or blocked tasks happen to sort ahead in a
+   * truncated window — i.e. no priority inversion.
    */
   static async getNextTask(queueName: string): Promise<Task | null> {
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
-    const taskIds = await client.zRange(queueKey, 0, 9, { REV: true }); // Get top 10 by priority
+    // Scan the whole queue from highest to lowest priority.
+    const taskIds = await client.zRange(queueKey, 0, -1, { REV: true });
 
     for (const taskId of taskIds) {
       const task = await this.getTask(taskId);
@@ -161,7 +232,7 @@ export class TaskQueue {
 
     task.retries += 1;
     task.status = 'retry';
-    task.error = undefined;
+    delete task.error;
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
@@ -235,6 +306,53 @@ export class TaskQueue {
     return deleted;
   }
 
+  /**
+   * Recover tasks orphaned by a crashed worker.
+   *
+   * A task whose worker dies stays in "processing" forever. This finds tasks
+   * that have been processing longer than `staleMs`, resets them to "queued",
+   * detaches the dead worker, and re-enqueues them so another worker can pick
+   * them up. Returns the number of tasks recovered.
+   */
+  static async recoverStaleTasks(staleMs: number = 5 * 60 * 1000): Promise<number> {
+    const client = getRedisClient();
+    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+    const now = Date.now();
+    let recovered = 0;
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (!task || task.status !== 'processing') {
+        continue;
+      }
+
+      const startedAt = task.startedAt ? new Date(task.startedAt).getTime() : 0;
+      if (startedAt === 0 || now - startedAt < staleMs) {
+        continue;
+      }
+
+      const previousWorker = task.workerId;
+      task.status = 'queued';
+      task.workerId = undefined;
+      await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+      const queueKey = `${QUEUE_PREFIX}${task.queue}`;
+      const score = this._calculateQueueScore(task.priority);
+      await client.zAdd(queueKey, { score, value: taskId });
+
+      recovered++;
+      logger.warn(
+        { taskId, previousWorker, stalledForMs: now - startedAt },
+        'Recovered orphaned task stuck in processing'
+      );
+    }
+
+    if (recovered > 0) {
+      logger.info({ recovered }, 'Orphaned tasks recovered');
+    }
+    return recovered;
+  }
+
   // Private helper methods
 
   private static _calculateQueueScore(priority: string): number {
@@ -273,5 +391,34 @@ export class TaskQueue {
     const client = getRedisClient();
     const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
     await client.hIncrBy(statsKey, 'pending', increment);
+  }
+
+  // Task statuses that are tracked as queue stat counters.
+  private static readonly STATS_BUCKETS: ReadonlyArray<TaskStatus> = [
+    'pending',
+    'processing',
+    'completed',
+    'failed',
+  ];
+
+  /**
+   * Move a task between queue stat counters when its status changes,
+   * decrementing the previous bucket and incrementing the new one so the
+   * counters stay consistent (e.g. pending -> processing -> completed).
+   */
+  private static async _transitionQueueStats(
+    queueName: string,
+    from: TaskStatus,
+    to: TaskStatus
+  ): Promise<void> {
+    const client = getRedisClient();
+    const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
+
+    if (this.STATS_BUCKETS.includes(from)) {
+      await client.hIncrBy(statsKey, from, -1);
+    }
+    if (this.STATS_BUCKETS.includes(to)) {
+      await client.hIncrBy(statsKey, to, 1);
+    }
   }
 }
