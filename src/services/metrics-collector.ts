@@ -79,9 +79,8 @@ export class MetricsCollector {
     }
 
     // Collect worker metrics
-    const workerKeys = await client.keys('worker:*');
-    for (const key of workerKeys) {
-      const workerId = key.replace('worker:', '');
+    const workerIds = await client.zRange('workers:index', 0, -1);
+    for (const workerId of workerIds) {
       try {
         const workerMetrics = await WorkerPool.getWorkerMetrics(workerId);
         metrics.workers[workerId] = workerMetrics;
@@ -91,8 +90,8 @@ export class MetricsCollector {
     }
 
     // Collect task stats
-    const taskIndexSize = await client.zcard('tasks:index');
-    const dlqSize = await client.llen('dlq:tasks');
+    const taskIndexSize = await client.zCard('tasks:index');
+    const dlqSize = await client.lLen('dlq:tasks');
 
     metrics.tasks = {
       totalInSystem: taskIndexSize,

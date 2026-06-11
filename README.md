@@ -29,16 +29,27 @@ A production-grade distributed task scheduling and execution framework with real
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Prerequisites
+
+- Node.js 18+
+- Redis 6+ (or Docker)
+- npm 9+
+
 ## Installation
 
 ```bash
 npm install
-npm run build
 ```
 
 ## Configuration
 
-Create a `.env` file:
+Copy the example environment file and adjust as needed:
+
+```bash
+cp .env.example .env
+```
+
+Available variables:
 
 ```env
 REDIS_URL=redis://localhost:6379
@@ -48,6 +59,18 @@ LOG_LEVEL=info
 
 ## Running
 
+### 1. Start Redis
+
+Using Docker (recommended):
+
+```bash
+docker-compose up -d
+```
+
+Or install Redis locally and start it.
+
+### 2. Start the Application
+
 ```bash
 # Development
 npm run dev
@@ -55,13 +78,26 @@ npm run dev
 # Production
 npm run build
 npm start
+```
 
-# Testing
+### 3. Run Tests
+
+```bash
 npm test
 
 # Watch mode
 npm run test:watch
 ```
+
+## Sample Task Handlers
+
+The application comes with three built-in demo handlers:
+
+| Handler | Description | Simulated Duration |
+|---------|-------------|-------------------|
+| `dataProcessor` | Processes data records | ~1s |
+| `emailSender` | Sends email messages | ~500ms |
+| `reportGenerator` | Generates reports | ~2s |
 
 ## API Examples
 
@@ -121,7 +157,7 @@ curl -X POST http://localhost:3000/api/workers/{workerId}/heartbeat
 
 ```
 src/
-├── index.ts                 # Application entry point
+├── index.ts                 # Application entry point & sample handlers
 ├── types/
 │   └── index.ts            # Type definitions
 ├── services/
@@ -190,11 +226,8 @@ pending → queued → processing → completed
 
 ## Contributing
 
-1. Run tests before submitting PRs
-2. Follow TypeScript strict mode
-3. Add tests for new features
-4. Update documentation
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup instructions, workflow guidelines, and how to claim issues.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE) for details.

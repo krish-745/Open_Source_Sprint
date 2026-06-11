@@ -41,11 +41,11 @@ export class WorkerPool {
     };
 
     await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
-    await client.zadd(WORKERS_INDEX, { score: Date.now(), member: workerId });
+    await client.zAdd(WORKERS_INDEX, { score: Date.now(), value: workerId });
 
     // Map handlers to worker
     for (const handler of handlers) {
-      await client.sadd(`${WORKER_HANDLERS}:${handler}`, workerId);
+      await client.sAdd(`${WORKER_HANDLERS}:${handler}`, workerId);
     }
 
     logger.info({ workerId, name, handlers }, 'Worker registered');
@@ -84,7 +84,7 @@ export class WorkerPool {
    */
   static async getAvailableWorkers(handler: string): Promise<Worker[]> {
     const client = getRedisClient();
-    const workerIds = await client.smembers(`${WORKER_HANDLERS}:${handler}`);
+    const workerIds = await client.sMembers(`${WORKER_HANDLERS}:${handler}`);
 
     const availableWorkers: Worker[] = [];
 
@@ -119,7 +119,7 @@ export class WorkerPool {
     worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
 
     await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
-    await client.lpush(`worker:${workerId}:tasks`, task.id);
+    await client.lPush(`worker:${workerId}:tasks`, task.id);
 
     logger.info({ workerId, taskId: task.id }, 'Task assigned to worker');
   }
@@ -149,7 +149,7 @@ export class WorkerPool {
     worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
 
     await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
-    await client.lrem(`worker:${workerId}:tasks`, 1, taskId);
+    await client.lRem(`worker:${workerId}:tasks`, 1, taskId);
 
     // Store metrics
     const metricsKey = `${METRICS_PREFIX}${workerId}:${Date.now()}`;
@@ -185,7 +185,7 @@ export class WorkerPool {
    */
   static async checkStaleWorkers(timeoutSeconds: number = 60): Promise<number> {
     const client = getRedisClient();
-    const allWorkers = await client.zrange(WORKERS_INDEX, 0, -1);
+    const allWorkers = await client.zRange(WORKERS_INDEX, 0, -1);
 
     let staleCount = 0;
     const now = Date.now();
@@ -193,7 +193,7 @@ export class WorkerPool {
 
     for (const workerId of allWorkers) {
       const worker = await this.getWorker(workerId);
-      if (worker && now - worker.lastHeartbeat.getTime() > timeout) {
+      if (worker && now - new Date(worker.lastHeartbeat).getTime() > timeout) {
         worker.status = 'offline';
         await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
         staleCount++;
@@ -247,11 +247,11 @@ export class WorkerPool {
 
     // Remove from handlers map
     for (const handler of worker.handlers) {
-      await client.srem(`${WORKER_HANDLERS}:${handler}`, workerId);
+      await client.sRem(`${WORKER_HANDLERS}:${handler}`, workerId);
     }
 
     await client.del(`${WORKER_PREFIX}${workerId}`);
-    await client.zrem(WORKERS_INDEX, workerId);
+    await client.zRem(WORKERS_INDEX, workerId);
 
     logger.info({ workerId }, 'Worker unregistered');
   }

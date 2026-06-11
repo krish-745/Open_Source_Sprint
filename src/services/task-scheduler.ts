@@ -21,9 +21,9 @@ export class TaskScheduler {
     const client = getRedisClient();
     const scheduleTime = Date.now() + delayMs;
 
-    await client.zadd(SCHEDULED_TASKS_KEY, {
+    await client.zAdd(SCHEDULED_TASKS_KEY, {
       score: scheduleTime,
-      member: JSON.stringify({ taskId, callback: callback.toString() }),
+      value: JSON.stringify({ taskId, callback: callback.toString() }),
     });
 
     logger.info({ taskId, delayMs }, 'Task scheduled with delay');
@@ -104,7 +104,7 @@ export class TaskScheduler {
         }
 
         // Get all tasks due to run
-        const dueTasks = await client.zrangebyscore(SCHEDULED_TASKS_KEY, 0, now);
+        const dueTasks = await client.zRange(SCHEDULED_TASKS_KEY, 0, now, { BY: 'SCORE' });
 
         for (const taskData of dueTasks) {
           try {
@@ -117,7 +117,7 @@ export class TaskScheduler {
               logger.info({ taskId }, 'Scheduled task moved to queue');
             }
 
-            await client.zrem(SCHEDULED_TASKS_KEY, taskData);
+            await client.zRem(SCHEDULED_TASKS_KEY, taskData);
           } catch (error) {
             logger.error({ error, taskData }, 'Failed to process scheduled task');
           }
@@ -160,15 +160,11 @@ export class TaskScheduler {
    */
   static async getPendingScheduledTasks(): Promise<any[]> {
     const client = getRedisClient();
-    const tasks = await client.zrange(SCHEDULED_TASKS_KEY, 0, -1, { withScores: true });
+    const tasks = await client.zRangeWithScores(SCHEDULED_TASKS_KEY, 0, -1);
 
-    return tasks.map((item, index) => {
-      if (index % 2 === 0) {
-        return {
-          ...JSON.parse(item),
-          scheduledAt: tasks[index + 1],
-        };
-      }
-    }).filter(Boolean);
+    return tasks.map((item) => ({
+      ...JSON.parse(item.value),
+      scheduledAt: item.score,
+    }));
   }
 }

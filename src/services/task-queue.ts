@@ -57,12 +57,12 @@ export class TaskQueue {
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
     // Add to task index
-    await client.zadd(TASK_INDEX_KEY, { score: Date.now(), member: taskId });
+    await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
 
     // Add to queue
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
     const score = this._calculateQueueScore(task.priority);
-    await client.zadd(queueKey, { score, member: taskId });
+    await client.zAdd(queueKey, { score, value: taskId });
 
     // Update queue metadata
     await this._updateQueueStats(queueName, 1);
@@ -113,7 +113,7 @@ export class TaskQueue {
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
-    const taskIds = await client.zrevrange(queueKey, 0, 9); // Get top 10 by priority
+    const taskIds = await client.zRange(queueKey, 0, 9, { REV: true }); // Get top 10 by priority
 
     for (const taskId of taskIds) {
       const task = await this.getTask(taskId);
@@ -126,7 +126,7 @@ export class TaskQueue {
       }
 
       // Skip if scheduled for later
-      if (task.scheduledFor && task.scheduledFor > new Date()) {
+      if (task.scheduledFor && new Date(task.scheduledFor) > new Date()) {
         continue;
       }
 
@@ -160,7 +160,7 @@ export class TaskQueue {
 
     const queueKey = `${QUEUE_PREFIX}${task.queue}`;
     const score = this._calculateQueueScore(task.priority);
-    await client.zadd(queueKey, { score, member: taskId });
+    await client.zAdd(queueKey, { score, value: taskId });
 
     logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
     return true;
@@ -173,7 +173,7 @@ export class TaskQueue {
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
-    const taskIds = await client.zrevrange(queueKey, offset, offset + limit - 1);
+    const taskIds = await client.zRange(queueKey, offset, offset + limit - 1, { REV: true });
     const tasks: Task[] = [];
 
     for (const taskId of taskIds) {
@@ -192,8 +192,8 @@ export class TaskQueue {
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
     const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
 
-    const queueSize = await client.zcard(queueKey);
-    const stats = await client.hgetall(statsKey);
+    const queueSize = await client.zCard(queueKey);
+    const stats = await client.hGetAll(statsKey);
 
     return {
       queueName,
@@ -212,14 +212,14 @@ export class TaskQueue {
     const client = getRedisClient();
     const cutoffTime = Date.now() - hoursAgo * 60 * 60 * 1000;
 
-    const allTaskIds = await client.zrevrangebyscore(TASK_INDEX_KEY, cutoffTime, 0);
+    const allTaskIds = await client.zRange(TASK_INDEX_KEY, cutoffTime, 0, { BY: 'SCORE', REV: true });
     let deleted = 0;
 
     for (const taskId of allTaskIds) {
       const task = await this.getTask(taskId);
       if (task && (task.status === 'completed' || task.status === 'failed')) {
         await client.del(`${TASK_PREFIX}${taskId}`);
-        await client.zrem(TASK_INDEX_KEY, taskId);
+        await client.zRem(TASK_INDEX_KEY, taskId);
         deleted++;
       }
     }
@@ -256,7 +256,7 @@ export class TaskQueue {
 
     if (task) {
       task.status = 'failed';
-      await client.lpush(DEAD_LETTER_QUEUE, JSON.stringify(task));
+      await client.lPush(DEAD_LETTER_QUEUE, JSON.stringify(task));
       await client.del(`${TASK_PREFIX}${taskId}`);
       logger.warn({ taskId }, 'Task moved to DLQ');
     }
@@ -265,6 +265,6 @@ export class TaskQueue {
   private static async _updateQueueStats(queueName: string, increment: number): Promise<void> {
     const client = getRedisClient();
     const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
-    await client.hincrby(statsKey, 'pending', increment);
+    await client.hIncrBy(statsKey, 'pending', increment);
   }
 }

@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import { initializeRedis, closeRedis } from './services/redis';
 import { TaskScheduler } from './services/task-scheduler';
 import { MetricsCollector } from './services/metrics-collector';
+import { TaskExecutor } from './services/task-executor';
 import apiRoutes from './routes/api';
 import logger from './utils/logger';
 
@@ -43,12 +44,39 @@ async function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
+// Register sample task handlers
+function registerSampleHandlers() {
+  TaskExecutor.registerHandler('dataProcessor', async (payload) => {
+    logger.info({ payload }, 'Processing data...');
+    // Simulate processing work
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    return { processed: true, records: payload.records || 0 };
+  });
+
+  TaskExecutor.registerHandler('emailSender', async (payload) => {
+    logger.info({ payload }, 'Sending email...');
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    return { sent: true, to: payload.to || 'unknown' };
+  });
+
+  TaskExecutor.registerHandler('reportGenerator', async (payload) => {
+    logger.info({ payload }, 'Generating report...');
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    return { report: 'generated', format: payload.format || 'pdf' };
+  });
+
+  logger.info('Sample task handlers registered');
+}
+
 // Start server
 async function start() {
   try {
     // Initialize Redis
     await initializeRedis(REDIS_URL);
     logger.info('Redis initialized');
+
+    // Register handlers
+    registerSampleHandlers();
 
     // Start scheduler
     await TaskScheduler.startScheduler();
@@ -67,5 +95,3 @@ async function start() {
 }
 
 start();
-
-export default app;

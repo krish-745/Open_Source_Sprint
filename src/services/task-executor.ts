@@ -23,6 +23,7 @@ export class TaskExecutor {
    */
   static async execute(workerId: string, task: Task): Promise<void> {
     const startTime = Date.now();
+    let timeoutHandle: NodeJS.Timeout | undefined;
 
     try {
       // Validate handler exists
@@ -47,7 +48,11 @@ export class TaskExecutor {
       // Execute with timeout
       const result = await Promise.race([
         handler(task.payload),
-        this._timeoutPromise(task.timeout),
+        new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(new Error(`Task execution timeout after ${task.timeout}ms`));
+          }, task.timeout);
+        }),
       ]);
 
       // Mark as completed
@@ -99,6 +104,7 @@ export class TaskExecutor {
         });
       }
     } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
       await WorkerPool.updateWorkerStatus(workerId, 'idle');
     }
   }
