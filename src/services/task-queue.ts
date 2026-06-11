@@ -228,6 +228,30 @@ export class TaskQueue {
     return deleted;
   }
 
+  /**
+   * Put a task back on its queue for another worker to pick up, clearing any
+   * previous worker assignment. Used when a worker disconnects mid-execution.
+   * Returns false if the task no longer exists.
+   */
+  static async requeueTask(taskId: string): Promise<boolean> {
+    const client = getRedisClient();
+    const task = await this.getTask(taskId);
+    if (!task) {
+      return false;
+    }
+
+    task.status = 'queued';
+    task.workerId = undefined;
+    await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+    const queueKey = `${QUEUE_PREFIX}${task.queue}`;
+    const score = this._calculateQueueScore(task.priority);
+    await client.zAdd(queueKey, { score, value: taskId });
+
+    logger.info({ taskId }, 'Task requeued');
+    return true;
+  }
+
   // Private helper methods
 
   private static _calculateQueueScore(priority: string): number {
