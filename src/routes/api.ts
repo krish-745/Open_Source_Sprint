@@ -1,9 +1,10 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { TaskQueue } from '../services/task-queue';
+import { TaskQueue, QueueFullError } from '../services/task-queue';
 import { WorkerPool } from '../services/worker-pool';
 import { TaskExecutor } from '../services/task-executor';
 import { TaskScheduler } from '../services/task-scheduler';
 import { MetricsCollector } from '../services/metrics-collector';
+import { getRedisStatus } from '../services/redis';
 import logger from '../utils/logger';
 
 const router = express.Router();
@@ -43,7 +44,52 @@ router.post('/tasks', async (req: Request, res: Response) => {
     res.status(201).json(task);
   } catch (error: any) {
     logger.error({ error }, 'Create task error');
+    
+    if (error instanceof QueueFullError) {
+      return res.status(429).json({ error: error.message });
+    }
+    
     res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/tasks/batch', async (req: Request, res: Response) => {
+  try {
+    const { tasks } = req.body;
+
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+      return res.status(400).json({ error: 'tasks must be a non-empty array' });
+    }
+
+    // Validate everything before creating anything.
+    for (const [index, t] of tasks.entries()) {
+      if (!t.name || !t.handler) {
+        return res.status(400).json({ error: `Invalid task at index ${index}: name and handler are required` });
+      }
+      if (!TaskExecutor.hasHandler(t.handler)) {
+        return res.status(400).json({ error: `Unknown handler at index ${index}: ${t.handler}` });
+      }
+    }
+
+    const created = await TaskQueue.createTasksBatch(
+      tasks.map((t: any) => ({
+        name: t.name,
+        handler: t.handler,
+        payload: t.payload,
+        options: {
+          queueName: t.queueName,
+          priority: t.priority,
+          maxRetries: t.maxRetries,
+          timeout: t.timeout,
+          tags: t.tags,
+        },
+      }))
+    );
+
+    res.status(201).json({ count: created.length, taskIds: created.map((t) => t.id) });
+  } catch (error: any) {
+    logger.error({ error }, 'Batch create error');
+    res.status(400).json({ error: error.message });
   }
 });
 
@@ -154,6 +200,11 @@ router.get('/health', async (req: Request, res: Response) => {
     logger.error({ error }, 'Health check error');
     res.status(500).json({ error: error.message });
   }
+});
+
+router.get('/health/redis', (req: Request, res: Response) => {
+  const status = getRedisStatus();
+  res.status(status.connected ? 200 : 503).json(status);
 });
 
 router.get('/metrics', async (req: Request, res: Response) => {
