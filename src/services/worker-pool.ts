@@ -8,7 +8,26 @@ const WORKERS_INDEX = 'workers:index';
 const WORKER_HANDLERS = 'worker:handlers:map';
 const METRICS_PREFIX = 'metrics:worker:';
 
+export interface AutoScaleDecision {
+  action: 'scale_up' | 'scale_down' | 'none';
+  reason: string;
+}
+
 export class WorkerPool {
+  /**
+   * Auto-scaling thresholds (configurable).
+   * - scaleUpQueueDepth: queue size at which to add capacity
+   * - saturatedCapacityPct: average worker capacity considered "full"
+   * - cooldownMs: minimum time between scale events to prevent thrashing
+   */
+  static autoScaleConfig = {
+    scaleUpQueueDepth: 50,
+    saturatedCapacityPct: 80,
+    cooldownMs: 30_000,
+  };
+
+  private static lastScaleEventAt = 0;
+
   /**
    * Register a new worker
    */
@@ -232,6 +251,62 @@ export class WorkerPool {
       handlers: worker.handlers,
       lastHeartbeat: worker.lastHeartbeat,
     };
+  }
+
+  /**
+   * Average capacity (0-100) across non-offline workers.
+   */
+  static async getAverageCapacity(): Promise<number> {
+    const client = getRedisClient();
+    const workerIds = await client.zRange(WORKERS_INDEX, 0, -1);
+
+    let total = 0;
+    let count = 0;
+    for (const workerId of workerIds) {
+      const worker = await this.getWorker(workerId);
+      if (worker && worker.status !== 'offline') {
+        total += worker.capacity;
+        count++;
+      }
+    }
+
+    return count === 0 ? 0 : Math.round(total / count);
+  }
+
+  /**
+   * Decide whether to scale workers up or down based on queue depth and
+   * average capacity. Scales up when the queue is backing up and workers are
+   * saturated, scales down when the queue is empty, and otherwise does nothing.
+   * A cooldown between scale events prevents thrashing.
+   *
+   * Returns the decision; actual provisioning of workers is left to the
+   * deployment/orchestration layer that consumes this signal.
+   */
+  static evaluateAutoScaling(
+    queueDepth: number,
+    avgCapacity: number,
+    now: number = Date.now()
+  ): AutoScaleDecision {
+    const cfg = this.autoScaleConfig;
+
+    if (now - this.lastScaleEventAt < cfg.cooldownMs) {
+      return { action: 'none', reason: 'cooldown active' };
+    }
+
+    if (queueDepth >= cfg.scaleUpQueueDepth && avgCapacity >= cfg.saturatedCapacityPct) {
+      this.lastScaleEventAt = now;
+      return {
+        action: 'scale_up',
+        reason: `queue depth ${queueDepth} >= ${cfg.scaleUpQueueDepth} and capacity ${avgCapacity}% saturated`,
+      };
+    }
+
+    if (queueDepth === 0) {
+      this.lastScaleEventAt = now;
+      return { action: 'scale_down', reason: 'queue empty' };
+    }
+
+    return { action: 'none', reason: 'within thresholds' };
   }
 
   /**
