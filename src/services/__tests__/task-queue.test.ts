@@ -241,7 +241,6 @@ describe('TaskQueue', () => {
       const retrievedTask = await TaskQueue.getTask(task.id);
       // Should fall back to string 'true', preventing morphing into boolean `true`
       expect(retrievedTask!.result).toBe('true');
->>>>>>> 9828a89 (feat(task-queue): implement secure task result compression and strict metric tracking (#10))
     });
   });
 });
