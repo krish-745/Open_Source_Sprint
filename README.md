@@ -153,6 +153,18 @@ curl http://localhost:3000/api/health
 curl -X POST http://localhost:3000/api/workers/{workerId}/heartbeat
 ```
 
+## API Documentation
+
+A full OpenAPI 3.0 specification is available in [`openapi.yml`](./openapi.yml), covering every endpoint with request/response schemas and examples.
+
+To explore it with Swagger UI:
+
+- Paste the file contents into the [Swagger Editor](https://editor.swagger.io/), or
+- Serve it locally:
+  ```bash
+  npx @redocly/cli preview-docs openapi.yml
+  ```
+
 ## Project Structure
 
 ```

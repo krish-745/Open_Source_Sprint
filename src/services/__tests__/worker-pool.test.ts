@@ -1,147 +1,188 @@
 import { WorkerPool } from '../worker-pool';
 import { TaskQueue } from '../task-queue';
-import { getRedisClient } from '../redis';
-import { Worker, Task } from '../../types';
+import * as redis from '../redis';
+import { Task } from '../../types';
 
-// Mock the Redis client using an in-memory store
-const store: Record<string, string> = {};
-const listStore: Record<string, string[]> = {};
-let workersIndex: string[] = [];
-
-const mockRedisClient = {
-  get: jest.fn().mockImplementation(async (key: string) => store[key] || null),
-  set: jest.fn().mockImplementation(async (key: string, value: string) => {
-    store[key] = value;
-    return 'OK';
-  }),
-  zRange: jest.fn().mockImplementation(async (key: string, start: number, stop: number) => {
-    return workersIndex;
-  }),
-  lRange: jest.fn().mockImplementation(async (key: string, start: number, stop: number) => {
-    return listStore[key] || [];
-  }),
-  lPush: jest.fn().mockImplementation(async (key: string, value: string) => {
-    if (!listStore[key]) listStore[key] = [];
-    listStore[key].push(value);
-    return listStore[key].length;
-  }),
-  del: jest.fn().mockImplementation(async (key: string) => {
-    delete store[key];
-    delete listStore[key];
-    return 1;
-  }),
-  zAdd: jest.fn().mockResolvedValue(1),
-};
-
-jest.mock('../redis', () => ({
-  getRedisClient: () => mockRedisClient,
+jest.mock('../redis');
+jest.mock('../task-queue', () => ({
+  TaskQueue: {
+    reclaimStuckTasks: jest.fn().mockResolvedValue(1),
+  },
 }));
 
-// Mock TaskQueue methods
-jest.mock('../task-queue', () => {
-  const original = jest.requireActual('../task-queue');
+const mockedGetRedisClient = redis.getRedisClient as jest.Mock;
+
+/**
+ * Minimal in-memory Redis fake implementing the commands WorkerPool uses
+ * (strings, sets, sorted sets, lists). Keeps the worker-pool operations under
+ * test running end-to-end against shared state without requiring a live Redis.
+ */
+function makeFakeRedis() {
+  const strings = new Map<string, string>();
+  const sets = new Map<string, Set<string>>();
+  const zsets = new Map<string, Map<string, number>>();
+  const lists = new Map<string, string[]>();
+
   return {
-    TaskQueue: {
-      getTask: jest.fn(),
-      retryTask: jest.fn(),
-      updateTaskStatus: jest.fn(),
-      reclaimStuckTasks: jest.fn().mockImplementation(async (workerId: string) => {
-        // Simple mock implementation of reclaimStuckTasks to verify it's called
-        const client = getRedisClient();
-        const taskIds = await client.lRange(`worker:${workerId}:tasks`, 0, -1);
-        for (const taskId of taskIds) {
-          const task = await TaskQueue.getTask(taskId);
-          if (task && task.status === 'processing') {
-            task.workerId = undefined;
-            await client.set(`task:${taskId}`, JSON.stringify(task));
-            await TaskQueue.retryTask(taskId);
-          }
-        }
-        await client.del(`worker:${workerId}:tasks`);
-        return taskIds.length;
-      }),
-    },
+    set: jest.fn(async (k: string, v: string) => {
+      strings.set(k, v);
+      return 'OK';
+    }),
+    get: jest.fn(async (k: string) => strings.get(k) ?? null),
+    del: jest.fn(async (k: string) => {
+      strings.delete(k);
+      lists.delete(k);
+      return 1;
+    }),
+    sAdd: jest.fn(async (k: string, m: string) => {
+      const s = sets.get(k) ?? new Set<string>();
+      s.add(m);
+      sets.set(k, s);
+      return 1;
+    }),
+    sMembers: jest.fn(async (k: string) => Array.from(sets.get(k) ?? [])),
+    sRem: jest.fn(async (k: string, m: string) => {
+      sets.get(k)?.delete(m);
+      return 1;
+    }),
+    zAdd: jest.fn(async (k: string, { score, value }: { score: number; value: string }) => {
+      const z = zsets.get(k) ?? new Map<string, number>();
+      z.set(value, score);
+      zsets.set(k, z);
+      return 1;
+    }),
+    zRange: jest.fn(async (k: string, start: number, stop: number) => {
+      const z = zsets.get(k);
+      if (!z) return [];
+      const ordered = [...z.entries()].sort((a, b) => a[1] - b[1]).map((e) => e[0]);
+      return stop === -1 ? ordered.slice(start) : ordered.slice(start, stop + 1);
+    }),
+    zRem: jest.fn(async (k: string, m: string) => {
+      zsets.get(k)?.delete(m);
+      return 1;
+    }),
+    lPush: jest.fn(async (k: string, v: string) => {
+      const l = lists.get(k) ?? [];
+      l.unshift(v);
+      lists.set(k, l);
+      return l.length;
+    }),
+    lRem: jest.fn(async (k: string, _count: number, v: string) => {
+      const l = lists.get(k) ?? [];
+      const i = l.indexOf(v);
+      if (i >= 0) l.splice(i, 1);
+      return 1;
+    }),
+    __strings: strings,
+  } as any;
+}
+
+function buildTask(id: string): Task {
+  return {
+    id,
+    name: 'demo',
+    description: 'Task: demo',
+    priority: 'medium',
+    status: 'pending',
+    handler: 'noop',
+    payload: {},
+    retries: 0,
+    maxRetries: 3,
+    timeout: 30000,
+    createdAt: new Date(),
+    queue: 'default',
+    dependencies: [],
+    tags: [],
+    metadata: {},
   };
+}
+
+let client: ReturnType<typeof makeFakeRedis>;
+
+beforeEach(() => {
+  client = makeFakeRedis();
+  mockedGetRedisClient.mockReturnValue(client);
+  jest.clearAllMocks();
 });
 
-describe('WorkerPool - checkStaleWorkers and Task Reclamation', () => {
-  beforeEach(() => {
-    for (const key in store) delete store[key];
-    for (const key in listStore) delete listStore[key];
-    workersIndex = [];
-    jest.clearAllMocks();
+describe('WorkerPool registration and lookup', () => {
+  it('registers a worker, stores it, and maps its handlers', async () => {
+    const worker = await WorkerPool.registerWorker('w', ['noop', 'email'], { maxConcurrent: 3 });
+
+    const fetched = await WorkerPool.getWorker(worker.id);
+    expect(fetched?.id).toBe(worker.id);
+    expect(fetched?.maxConcurrent).toBe(3);
+
+    const forHandler = await client.sMembers('worker:handlers:map:noop');
+    expect(forHandler).toContain(worker.id);
   });
 
-  const createWorkerMock = (id: string, status: any, lastHeartbeat: Date): Worker => {
-    return {
-      id,
-      name: `Worker ${id}`,
-      status,
-      handlers: ['testHandler'],
-      maxConcurrent: 5,
-      currentTasks: 1,
-      totalProcessed: 10,
-      totalFailed: 0,
-      lastHeartbeat,
-      registeredAt: new Date(),
-      version: '1.0.0',
-      capacity: 20,
-      tags: [],
-    };
-  };
+  it('lists available workers for a handler', async () => {
+    const worker = await WorkerPool.registerWorker('w', ['noop']);
+    const available = await WorkerPool.getAvailableWorkers('noop');
+    expect(available.map((w) => w.id)).toContain(worker.id);
+  });
+});
 
-  const createTaskMock = (id: string, status: any, workerId?: string): Task => {
-    return {
-      id,
-      name: 'Stuck Task',
-      description: 'Desc',
-      priority: 'medium',
-      status,
-      handler: 'testHandler',
-      payload: {},
-      retries: 0,
-      maxRetries: 3,
-      timeout: 30000,
-      createdAt: new Date(),
-      queue: 'default',
-      dependencies: [],
-      tags: [],
-      metadata: {},
-      workerId,
-    };
-  };
+describe('WorkerPool task assignment lifecycle', () => {
+  it('increments currentTasks on assign and decrements + counts on complete', async () => {
+    const worker = await WorkerPool.registerWorker('w', ['noop'], { maxConcurrent: 5 });
 
-  it('should mark stale workers as offline and reclaim their processing tasks', async () => {
-    const workerId = 'stale-worker-1';
-    const taskId = 'stuck-task-1';
-    
-    // Heartbeat from 5 minutes ago (timeout is 60s)
-    const lastHeartbeat = new Date(Date.now() - 5 * 60 * 1000);
-    const worker = createWorkerMock(workerId, 'online', lastHeartbeat);
-    const task = createTaskMock(taskId, 'processing', workerId);
+    await WorkerPool.assignTask(worker.id, buildTask('t1'));
+    let state = await WorkerPool.getWorker(worker.id);
+    expect(state?.currentTasks).toBe(1);
+    expect(state?.capacity).toBe(20);
 
-    // Save mocks in database
-    store[`worker:${workerId}`] = JSON.stringify(worker);
-    store[`task:${taskId}`] = JSON.stringify(task);
-    workersIndex = [workerId];
-    listStore[`worker:${workerId}:tasks`] = [taskId];
+    await WorkerPool.completeTask(worker.id, 't1', { success: true });
+    state = await WorkerPool.getWorker(worker.id);
+    expect(state?.currentTasks).toBe(0);
+    expect(state?.totalProcessed).toBe(1);
+    expect(state?.totalFailed).toBe(0);
+  });
 
-    // Mock TaskQueue method returns
-    (TaskQueue.getTask as jest.Mock).mockResolvedValue(task);
-    (TaskQueue.retryTask as jest.Mock).mockResolvedValue(true);
+  it('tracks failures on complete', async () => {
+    const worker = await WorkerPool.registerWorker('w', ['noop']);
+    await WorkerPool.assignTask(worker.id, buildTask('t1'));
+    await WorkerPool.completeTask(worker.id, 't1', { success: false });
+
+    const state = await WorkerPool.getWorker(worker.id);
+    expect(state?.totalFailed).toBe(1);
+  });
+});
+
+describe('WorkerPool stale detection', () => {
+  it('marks workers offline when their heartbeat is older than the timeout and reclaims tasks', async () => {
+    const worker = await WorkerPool.registerWorker('w', ['noop']);
+
+    // Force an old heartbeat.
+    const stored = JSON.parse(client.__strings.get(`worker:${worker.id}`)!);
+    stored.lastHeartbeat = new Date(Date.now() - 120_000).toISOString();
+    await client.set(`worker:${worker.id}`, JSON.stringify(stored));
 
     const staleCount = await WorkerPool.checkStaleWorkers(60);
     expect(staleCount).toBe(1);
 
-    // Verify worker status is set to offline and capacity reset
-    const updatedWorkerData = store[`worker:${workerId}`];
-    expect(updatedWorkerData).toBeDefined();
-    const updatedWorker: Worker = JSON.parse(updatedWorkerData);
-    expect(updatedWorker.status).toBe('offline');
-    expect(updatedWorker.currentTasks).toBe(0);
-    expect(updatedWorker.capacity).toBe(0);
+    const state = await WorkerPool.getWorker(worker.id);
+    expect(state?.status).toBe('offline');
+    expect(state?.currentTasks).toBe(0);
+    expect(state?.capacity).toBe(0);
 
     // Verify task queue reclaimStuckTasks was called
-    expect(TaskQueue.reclaimStuckTasks).toHaveBeenCalledWith(workerId);
+    expect(TaskQueue.reclaimStuckTasks).toHaveBeenCalledWith(worker.id);
+  });
+
+  it('does not mark fresh workers offline', async () => {
+    await WorkerPool.registerWorker('w', ['noop']);
+    expect(await WorkerPool.checkStaleWorkers(60)).toBe(0);
+  });
+});
+
+describe('WorkerPool unregister', () => {
+  it('removes the worker and its handler mapping', async () => {
+    const worker = await WorkerPool.registerWorker('w', ['noop']);
+    await WorkerPool.unregisterWorker(worker.id);
+
+    expect(await WorkerPool.getWorker(worker.id)).toBeNull();
+    expect(await client.sMembers('worker:handlers:map:noop')).not.toContain(worker.id);
   });
 });
