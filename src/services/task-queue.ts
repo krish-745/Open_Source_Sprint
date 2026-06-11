@@ -9,6 +9,17 @@ const QUEUE_LIST_KEY = 'queues:all';
 const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
 
+/**
+ * Thrown when a queue has reached its maximum capacity (backpressure).
+ * The API layer maps this to HTTP 429 Too Many Requests.
+ */
+export class QueueFullError extends Error {
+  constructor(queueName: string, maxSize: number) {
+    super(`Queue ${queueName} exceeds maximum size of ${maxSize}`);
+    this.name = 'QueueFullError';
+  }
+}
+
 export class TaskQueue {
   /**
    * Create a new task and add it to the queue
@@ -32,6 +43,14 @@ export class TaskQueue {
     const client = getRedisClient();
     const taskId = uuidv4();
     const queueName = options.queueName || 'default';
+
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const maxQueueSize = parseInt(process.env.MAX_QUEUE_SIZE || '10000', 10);
+    const currentSize = await client.zCard(queueKey);
+
+    if (currentSize >= maxQueueSize) {
+      throw new QueueFullError(queueName, maxQueueSize);
+    }
 
     const task: Task = {
       id: taskId,
@@ -60,7 +79,6 @@ export class TaskQueue {
     await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
 
     // Add to queue
-    const queueKey = `${QUEUE_PREFIX}${queueName}`;
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
 

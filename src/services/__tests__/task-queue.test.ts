@@ -6,6 +6,8 @@ jest.mock('../redis', () => {
     get: jest.fn(),
     set: jest.fn(),
     zAdd: jest.fn(),
+    zCard: jest.fn(),
+    hIncrBy: jest.fn(),
     lPush: jest.fn(),
     del: jest.fn(),
   };
@@ -86,6 +88,31 @@ describe('TaskQueue', () => {
 
       expect(result).toBe(false);
       expect(redisClient.set).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('createTask (Fix #22)', () => {
+    it('should reject new tasks when queue size exceeds MAX_QUEUE_SIZE limit', async () => {
+      // Configure max size to 100
+      process.env.MAX_QUEUE_SIZE = '100';
+      
+      // Simulate queue already having 100 tasks
+      redisClient.zCard.mockResolvedValue(100);
+      
+      await expect(
+        TaskQueue.createTask('test-task', 'test-handler', {})
+      ).rejects.toThrow(/Queue default exceeds maximum size of 100/i);
+    });
+
+    it('should allow task creation when queue size is below MAX_QUEUE_SIZE limit', async () => {
+      process.env.MAX_QUEUE_SIZE = '100';
+      redisClient.zCard.mockResolvedValue(99);
+      redisClient.zAdd.mockResolvedValue(1); // Mock adding to set
+
+      const task = await TaskQueue.createTask('test-task', 'test-handler', {});
+      
+      expect(task).toBeDefined();
+      expect(task.name).toBe('test-task');
     });
   });
 });
