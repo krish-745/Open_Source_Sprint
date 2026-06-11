@@ -26,6 +26,15 @@ export class TaskExecutor {
     let timeoutHandle: NodeJS.Timeout | undefined;
 
     try {
+      // Do not run tasks that expired before they were picked up.
+      if (TaskQueue.isExpired(task)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled', {
+          error: 'Task expired before execution',
+        });
+        logger.warn({ taskId: task.id }, 'Skipped expired task');
+        return;
+      }
+
       // Validate handler exists
       const handler = this.handlers.get(task.handler);
       if (!handler) {

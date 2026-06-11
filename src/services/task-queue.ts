@@ -9,6 +9,15 @@ const QUEUE_LIST_KEY = 'queues:all';
 const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
 
+// Default time-to-live (seconds) per priority, used when a task is created
+// without an explicit ttl. Higher-priority tasks are given longer to start.
+const DEFAULT_TTL_BY_PRIORITY: Record<string, number> = {
+  critical: 3600,
+  high: 1800,
+  medium: 900,
+  low: 300,
+};
+
 export class TaskQueue {
   /**
    * Create a new task and add it to the queue
@@ -24,6 +33,7 @@ export class TaskQueue {
       timeout?: number;
       dependencies?: string[];
       scheduledFor?: Date;
+      ttl?: number;
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
@@ -32,22 +42,29 @@ export class TaskQueue {
     const client = getRedisClient();
     const taskId = uuidv4();
     const queueName = options.queueName || 'default';
+    const priority = options.priority || 'medium';
+
+    const createdAt = new Date();
+    const ttl = options.ttl ?? DEFAULT_TTL_BY_PRIORITY[priority];
+    const expiresAt = ttl ? new Date(createdAt.getTime() + ttl * 1000) : undefined;
 
     const task: Task = {
       id: taskId,
       name,
       description: `Task: ${name}`,
-      priority: options.priority || 'medium',
+      priority,
       status: 'pending',
       handler,
       payload,
       retries: 0,
       maxRetries: options.maxRetries || 3,
       timeout: options.timeout || 30000,
-      createdAt: new Date(),
+      createdAt,
       queue: queueName,
       dependencies: options.dependencies || [],
       scheduledFor: options.scheduledFor,
+      ttl,
+      expiresAt,
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
@@ -226,6 +243,47 @@ export class TaskQueue {
 
     logger.info({ deleted, hoursAgo }, 'Old tasks cleaned up');
     return deleted;
+  }
+
+  /**
+   * Whether a task has passed its expiry and has not started running yet.
+   * Only un-started tasks (pending/queued/blocked/retry) can expire.
+   */
+  static isExpired(task: Task, now: number = Date.now()): boolean {
+    if (!task.expiresAt) {
+      return false;
+    }
+    const notStarted = ['pending', 'queued', 'blocked', 'retry'].includes(task.status);
+    return notStarted && new Date(task.expiresAt).getTime() <= now;
+  }
+
+  /**
+   * Cancel tasks that expired before being picked up, removing them from their
+   * queue and marking them `cancelled`. Returns the number of expired tasks.
+   */
+  static async expireStaleTasks(): Promise<number> {
+    const client = getRedisClient();
+    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+    const now = Date.now();
+    let expired = 0;
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (!task || !this.isExpired(task, now)) {
+        continue;
+      }
+
+      task.status = 'cancelled';
+      await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+      await client.zRem(`${QUEUE_PREFIX}${task.queue}`, taskId);
+      expired++;
+      logger.warn({ taskId, expiresAt: task.expiresAt }, 'Task expired before execution');
+    }
+
+    if (expired > 0) {
+      logger.info({ expired }, 'Expired tasks cancelled');
+    }
+    return expired;
   }
 
   // Private helper methods

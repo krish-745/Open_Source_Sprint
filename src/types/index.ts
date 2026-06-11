@@ -22,6 +22,8 @@ export interface Task {
   queue: string;
   dependencies: string[]; // Task IDs this task depends on
   scheduledFor?: Date; // For delayed tasks
+  ttl?: number; // Time-to-live in seconds before an unstarted task expires
+  expiresAt?: Date; // Absolute expiry time, derived from ttl at creation
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
