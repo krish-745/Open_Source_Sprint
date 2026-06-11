@@ -38,6 +38,7 @@ export class TaskQueue {
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
+      groupId?: string;
     } = {}
   ): Promise<Task> {
     const client = getRedisClient();
@@ -70,6 +71,7 @@ export class TaskQueue {
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
+      groupId: options.groupId,
     };
 
     // Store task
@@ -77,6 +79,11 @@ export class TaskQueue {
 
     // Add to task index
     await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
+
+    // Add to group index if groupId is provided
+    if (options.groupId) {
+      await client.sAdd(`group:${options.groupId}:tasks`, taskId);
+    }
 
     // Add to queue
     const score = this._calculateQueueScore(task.priority);
@@ -124,6 +131,95 @@ export class TaskQueue {
 
     logger.info({ count: created.length }, 'Batch of tasks created');
     return created;
+  }
+
+  /**
+   * Get all tasks in a group
+   */
+  static async getGroupTasks(groupId: string): Promise<Task[]> {
+    const client = getRedisClient();
+    const taskIds = await client.sMembers(`group:${groupId}:tasks`);
+    const tasks: Task[] = [];
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (task) {
+        tasks.push(task);
+      }
+    }
+
+    return tasks;
+  }
+
+  /**
+   * Get status statistics for a task group
+   */
+  static async getGroupStatus(groupId: string) {
+    const tasks = await this.getGroupTasks(groupId);
+    if (tasks.length === 0) {
+      return null;
+    }
+
+    let completedCount = 0;
+    let failedCount = 0;
+    let processingCount = 0;
+    let pendingCount = 0;
+    let queuedCount = 0;
+    let retryCount = 0;
+    let blockedCount = 0;
+    let cancelledCount = 0;
+    const results: Record<string, any> = {};
+
+    for (const task of tasks) {
+      switch (task.status) {
+        case 'completed':
+          completedCount++;
+          if (task.result !== undefined) {
+            results[task.id] = task.result;
+          }
+          break;
+        case 'failed':
+          failedCount++;
+          break;
+        case 'processing':
+          processingCount++;
+          break;
+        case 'pending':
+          pendingCount++;
+          break;
+        case 'queued':
+          queuedCount++;
+          break;
+        case 'retry':
+          retryCount++;
+          break;
+        case 'blocked':
+          blockedCount++;
+          break;
+        case 'cancelled':
+          cancelledCount++;
+          break;
+      }
+    }
+
+    const totalTasks = tasks.length;
+    const completionPercentage = totalTasks > 0 ? (completedCount / totalTasks) * 100 : 0;
+
+    return {
+      groupId,
+      totalTasks,
+      completedTasks: completedCount,
+      failedTasks: failedCount,
+      processingTasks: processingCount,
+      pendingTasks: pendingCount,
+      queuedTasks: queuedCount,
+      retryTasks: retryCount,
+      blockedTasks: blockedCount,
+      cancelledTasks: cancelledCount,
+      completionPercentage,
+      tasks,
+      results,
+    };
   }
 
   /**
