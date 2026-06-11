@@ -105,7 +105,13 @@ export class TaskExecutor {
       }
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
-      await WorkerPool.updateWorkerStatus(workerId, 'idle');
+      try {
+        const worker = await WorkerPool.getWorker(workerId);
+        const nextStatus = (worker && worker.currentTasks > 0) ? 'busy' : 'idle';
+        await WorkerPool.updateWorkerStatus(workerId, nextStatus);
+      } catch (err: any) {
+        logger.error({ workerId, error: err.message }, 'Failed to update worker status in finally block');
+      }
     }
   }
 
