@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
-import { Task, TaskStatus, Queue, RecurrenceRule } from '../types';
+import { Task, TaskStatus, Queue, RecurrenceRule, ConsensusOptions } from '../types';
 
 const TASK_PREFIX = 'task:';
 const QUEUE_PREFIX = 'queue:';
@@ -38,6 +38,7 @@ export class TaskQueue {
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
+      consensus?: ConsensusOptions;
     } = {}
   ): Promise<Task> {
     const client = getRedisClient();
@@ -70,6 +71,7 @@ export class TaskQueue {
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
+      consensus: options.consensus,
     };
 
     // Store task
