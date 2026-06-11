@@ -154,7 +154,7 @@ export class TaskQueue {
 
     task.retries += 1;
     task.status = 'retry';
-    task.error = undefined;
+    delete task.error;
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
