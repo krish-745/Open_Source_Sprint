@@ -9,6 +9,10 @@ const SCHEDULER_LOCK = 'scheduler:lock';
 export class TaskScheduler {
   private static cronJobs: Map<string, cron.ScheduledTask> = new Map();
   private static schedulerRunning = false;
+  private static pollTimeout: NodeJS.Timeout | null = null;
+
+  static lockTtlSeconds = parseInt(process.env.SCHEDULER_LOCK_TTL || '10', 10);
+  static renewalIntervalMs = parseInt(process.env.SCHEDULER_RENEWAL_INTERVAL_MS || '3000', 10);
 
   /**
    * Schedule a one-time delayed task
@@ -85,58 +89,75 @@ export class TaskScheduler {
     const processScheduledTasks = async () => {
       if (!this.schedulerRunning) return;
 
+      let renewalTimer: NodeJS.Timeout | null = null;
+      const client = getRedisClient();
+      const lockKey = `${SCHEDULER_LOCK}`;
+      const lockId = `scheduler-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+
       try {
-        const client = getRedisClient();
-        const now = Date.now();
-
-        // Acquire lock for distributed scheduling
-        const lockKey = `${SCHEDULER_LOCK}`;
-        const lockId = `scheduler-${Date.now()}`;
-
         const acquired = await client.set(lockKey, lockId, {
           NX: true,
-          EX: 10,
+          EX: TaskScheduler.lockTtlSeconds,
         });
 
-        if (!acquired) {
-          // Another instance is processing
-          return;
-        }
-
-        // Get all tasks due to run
-        const dueTasks = await client.zRange(SCHEDULED_TASKS_KEY, 0, now, { BY: 'SCORE' });
-
-        for (const taskData of dueTasks) {
-          try {
-            const { taskId } = JSON.parse(taskData);
-            const task = await TaskQueue.getTask(taskId);
-
-            if (task) {
-              // Move to queue for processing
-              await TaskQueue.updateTaskStatus(taskId, 'queued');
-              logger.info({ taskId }, 'Scheduled task moved to queue');
+        if (acquired) {
+          // Start lock renewal
+          renewalTimer = setInterval(async () => {
+            try {
+              const currentLock = await client.get(lockKey);
+              if (currentLock === lockId) {
+                await client.expire(lockKey, TaskScheduler.lockTtlSeconds);
+              } else {
+                if (renewalTimer) clearInterval(renewalTimer);
+              }
+            } catch (err) {
+              logger.error({ err }, 'Failed to renew scheduler lock');
             }
+          }, TaskScheduler.renewalIntervalMs);
 
-            await client.zRem(SCHEDULED_TASKS_KEY, taskData);
-          } catch (error) {
-            logger.error({ error, taskData }, 'Failed to process scheduled task');
+          const now = Date.now();
+
+          // Get all tasks due to run
+          const dueTasks = await client.zRange(SCHEDULED_TASKS_KEY, 0, now, { BY: 'SCORE' });
+
+          for (const taskData of dueTasks) {
+            try {
+              const { taskId } = JSON.parse(taskData);
+              const task = await TaskQueue.getTask(taskId);
+
+              if (task) {
+                // Move to queue for processing
+                await TaskQueue.updateTaskStatus(taskId, 'queued');
+                logger.info({ taskId }, 'Scheduled task moved to queue');
+              }
+
+              await client.zRem(SCHEDULED_TASKS_KEY, taskData);
+            } catch (error) {
+              logger.error({ error, taskData }, 'Failed to process scheduled task');
+            }
           }
-        }
 
-        // Recover tasks orphaned by crashed workers while holding the lock.
-        await TaskQueue.recoverStaleTasks();
-
-        // Release lock
-        const currentLock = await client.get(lockKey);
-        if (currentLock === lockId) {
-          await client.del(lockKey);
+          // Recover tasks orphaned by crashed workers while holding the lock.
+          await TaskQueue.recoverStaleTasks();
         }
       } catch (error) {
         logger.error({ error }, 'Scheduler error');
-      }
+      } finally {
+        if (renewalTimer) {
+          clearInterval(renewalTimer);
+        }
+        try {
+          const currentLock = await client.get(lockKey);
+          if (currentLock === lockId) {
+            await client.del(lockKey);
+          }
+        } catch (err) {
+          logger.error({ err }, 'Failed to release scheduler lock');
+        }
 
-      // Schedule next run
-      setTimeout(processScheduledTasks, pollIntervalMs);
+        // Schedule next run
+        TaskScheduler.pollTimeout = setTimeout(processScheduledTasks, pollIntervalMs);
+      }
     };
 
     // Start the polling loop
@@ -148,6 +169,11 @@ export class TaskScheduler {
    */
   static async stopScheduler(): Promise<void> {
     this.schedulerRunning = false;
+
+    if (this.pollTimeout) {
+      clearTimeout(this.pollTimeout);
+      this.pollTimeout = null;
+    }
 
     // Stop all cron jobs
     for (const job of this.cronJobs.values()) {
