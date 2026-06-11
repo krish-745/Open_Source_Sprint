@@ -22,6 +22,7 @@ export interface Task {
   queue: string;
   dependencies: string[]; // Task IDs this task depends on
   scheduledFor?: Date; // For delayed tasks
+  traceId?: string; // Correlation id for distributed tracing across a task chain
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;

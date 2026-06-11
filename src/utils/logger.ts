@@ -12,4 +12,12 @@ const logger = pino({
   },
 });
 
+/**
+ * Create a child logger bound to a trace id, so all log lines emitted for a
+ * task chain carry the same correlation id for distributed tracing.
+ */
+export function traceLogger(traceId: string) {
+  return logger.child({ traceId });
+}
+
 export default logger;

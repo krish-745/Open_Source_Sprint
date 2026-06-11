@@ -35,6 +35,7 @@ export class TaskQueue {
       timeout?: number;
       dependencies?: string[];
       scheduledFor?: Date;
+      traceId?: string;
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
@@ -52,6 +53,15 @@ export class TaskQueue {
       throw new QueueFullError(queueName, maxQueueSize);
     }
 
+    // Trace id: use an explicit one, else inherit from the first dependency so a
+    // dependency chain shares a correlation id, else start a new trace.
+    let traceId = options.traceId;
+    if (!traceId && options.dependencies && options.dependencies.length > 0) {
+      const parent = await this.getTask(options.dependencies[0]);
+      traceId = parent?.traceId;
+    }
+    traceId = traceId || uuidv4();
+
     const task: Task = {
       id: taskId,
       name,
@@ -67,6 +77,7 @@ export class TaskQueue {
       queue: queueName,
       dependencies: options.dependencies || [],
       scheduledFor: options.scheduledFor,
+      traceId,
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
@@ -74,6 +85,7 @@ export class TaskQueue {
 
     // Store task
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+    logger.info({ taskId, traceId }, 'Task created with trace id');
 
     // Add to task index
     await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
@@ -133,6 +145,23 @@ export class TaskQueue {
     const client = getRedisClient();
     const data = await client.get(`${TASK_PREFIX}${taskId}`);
     return data ? JSON.parse(data) : null;
+  }
+
+  /**
+   * Get all tasks sharing a trace id, for distributed-tracing queries across a
+   * dependency chain.
+   */
+  static async getTasksByTrace(traceId: string): Promise<Task[]> {
+    const client = getRedisClient();
+    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+    const tasks: Task[] = [];
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (task && task.traceId === traceId) {
+        tasks.push(task);
+      }
+    }
+    return tasks;
   }
 
   /**
