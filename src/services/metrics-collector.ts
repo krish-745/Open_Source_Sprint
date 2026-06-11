@@ -17,6 +17,10 @@ export interface SystemMetrics {
 export class MetricsCollector {
   private static collectionRunning = false;
 
+  static maxSnapshots = parseInt(process.env.METRICS_MAX_SNAPSHOTS || '1000', 10);
+  static retentionTimeSeconds = parseInt(process.env.METRICS_RETENTION_TIME_SECONDS || '604800', 10);
+  static maxHeapMemoryBytes = parseInt(process.env.METRICS_MAX_HEAP_MEMORY_BYTES || '524288000', 10);
+
   /**
    * Start collecting metrics periodically
    */
@@ -100,7 +104,24 @@ export class MetricsCollector {
 
     // Store snapshot
     const snapshotKey = `${SNAPSHOT_PREFIX}${Date.now()}`;
-    await client.set(snapshotKey, JSON.stringify(metrics), { EX: 7 * 24 * 60 * 60 });
+    await client.set(snapshotKey, JSON.stringify(metrics), { EX: MetricsCollector.retentionTimeSeconds });
+
+    // Clean up older snapshots if limit exceeded
+    try {
+      const keys = await client.keys(`${SNAPSHOT_PREFIX}*`);
+      if (keys.length > MetricsCollector.maxSnapshots) {
+        keys.sort((a, b) => {
+          return this._extractSnapshotTimestamp(a) - this._extractSnapshotTimestamp(b);
+        });
+        const toDeleteCount = keys.length - MetricsCollector.maxSnapshots;
+        const keysToDelete = keys.slice(0, toDeleteCount);
+        for (const key of keysToDelete) {
+          await client.del(key);
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, 'Failed to clean up old metrics snapshots');
+    }
 
     logger.debug({ timestamp }, 'Metrics snapshot captured');
 
@@ -171,6 +192,12 @@ export class MetricsCollector {
       if (dlqSize > 100) {
         health = health === 'critical' ? 'critical' : 'degraded';
         issues.push(`High DLQ size: ${dlqSize}`);
+      }
+
+      const heapUsed = snapshot.system?.memoryUsage?.heapUsed || 0;
+      if (heapUsed > MetricsCollector.maxHeapMemoryBytes) {
+        health = health === 'critical' ? 'critical' : 'degraded';
+        issues.push(`High heap memory usage: ${Math.round(heapUsed / (1024 * 1024))} MB`);
       }
 
       return {
