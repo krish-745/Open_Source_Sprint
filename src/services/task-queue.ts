@@ -18,6 +18,17 @@ const DEFAULT_TTL_BY_PRIORITY: Record<string, number> = {
   low: 300,
 };
 
+/**
+ * Thrown when a queue has reached its maximum capacity (backpressure).
+ * The API layer maps this to HTTP 429 Too Many Requests.
+ */
+export class QueueFullError extends Error {
+  constructor(queueName: string, maxSize: number) {
+    super(`Queue ${queueName} exceeds maximum size of ${maxSize}`);
+    this.name = 'QueueFullError';
+  }
+}
+
 export class TaskQueue {
   /**
    * Create a new task and add it to the queue
@@ -48,6 +59,14 @@ export class TaskQueue {
     const ttl = options.ttl ?? DEFAULT_TTL_BY_PRIORITY[priority];
     const expiresAt = ttl ? new Date(createdAt.getTime() + ttl * 1000) : undefined;
 
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const maxQueueSize = parseInt(process.env.MAX_QUEUE_SIZE || '10000', 10);
+    const currentSize = await client.zCard(queueKey);
+
+    if (currentSize >= maxQueueSize) {
+      throw new QueueFullError(queueName, maxQueueSize);
+    }
+
     const task: Task = {
       id: taskId,
       name,
@@ -77,7 +96,6 @@ export class TaskQueue {
     await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
 
     // Add to queue
-    const queueKey = `${QUEUE_PREFIX}${queueName}`;
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
 
@@ -86,6 +104,43 @@ export class TaskQueue {
 
     logger.info({ taskId, queueName }, 'Task created');
     return task;
+  }
+
+  /**
+   * Create multiple tasks in one call.
+   *
+   * Validates every input up front (non-empty, within the 1000-task limit, each
+   * with a name and handler) so the batch is rejected before anything is
+   * written if any entry is invalid. Returns the created tasks in order.
+   */
+  static async createTasksBatch(
+    inputs: Array<{
+      name: string;
+      handler: string;
+      payload?: Record<string, any>;
+      options?: Parameters<typeof TaskQueue.createTask>[3];
+    }>
+  ): Promise<Task[]> {
+    if (inputs.length === 0) {
+      throw new Error('Batch must contain at least one task');
+    }
+    if (inputs.length > 1000) {
+      throw new Error('Batch size exceeds the maximum of 1000 tasks');
+    }
+
+    inputs.forEach((input, index) => {
+      if (!input.name || !input.handler) {
+        throw new Error(`Invalid task at index ${index}: name and handler are required`);
+      }
+    });
+
+    const created: Task[] = [];
+    for (const input of inputs) {
+      created.push(await this.createTask(input.name, input.handler, input.payload || {}, input.options || {}));
+    }
+
+    logger.info({ count: created.length }, 'Batch of tasks created');
+    return created;
   }
 
   /**
@@ -132,13 +187,22 @@ export class TaskQueue {
   }
 
   /**
-   * Get next task from queue (considering priority and dependencies)
+   * Get next task from queue.
+   *
+   * Priority semantics: tasks are ordered by a priority-derived score
+   * (critical > high > medium > low) in the queue sorted set, and this returns
+   * the highest-priority task that is actually runnable (dependencies met and
+   * not scheduled for the future). The full queue is scanned in priority order
+   * rather than only the top N, so a runnable high-priority task is never
+   * skipped because lower-priority or blocked tasks happen to sort ahead in a
+   * truncated window — i.e. no priority inversion.
    */
   static async getNextTask(queueName: string): Promise<Task | null> {
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
-    const taskIds = await client.zRange(queueKey, 0, 9, { REV: true }); // Get top 10 by priority
+    // Scan the whole queue from highest to lowest priority.
+    const taskIds = await client.zRange(queueKey, 0, -1, { REV: true });
 
     for (const taskId of taskIds) {
       const task = await this.getTask(taskId);
@@ -292,6 +356,53 @@ export class TaskQueue {
       logger.info({ expired }, 'Expired tasks cancelled');
     }
     return expired;
+  }
+
+  /**
+   * Recover tasks orphaned by a crashed worker.
+   *
+   * A task whose worker dies stays in "processing" forever. This finds tasks
+   * that have been processing longer than `staleMs`, resets them to "queued",
+   * detaches the dead worker, and re-enqueues them so another worker can pick
+   * them up. Returns the number of tasks recovered.
+   */
+  static async recoverStaleTasks(staleMs: number = 5 * 60 * 1000): Promise<number> {
+    const client = getRedisClient();
+    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+    const now = Date.now();
+    let recovered = 0;
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (!task || task.status !== 'processing') {
+        continue;
+      }
+
+      const startedAt = task.startedAt ? new Date(task.startedAt).getTime() : 0;
+      if (startedAt === 0 || now - startedAt < staleMs) {
+        continue;
+      }
+
+      const previousWorker = task.workerId;
+      task.status = 'queued';
+      task.workerId = undefined;
+      await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+      const queueKey = `${QUEUE_PREFIX}${task.queue}`;
+      const score = this._calculateQueueScore(task.priority);
+      await client.zAdd(queueKey, { score, value: taskId });
+
+      recovered++;
+      logger.warn(
+        { taskId, previousWorker, stalledForMs: now - startedAt },
+        'Recovered orphaned task stuck in processing'
+      );
+    }
+
+    if (recovered > 0) {
+      logger.info({ recovered }, 'Orphaned tasks recovered');
+    }
+    return recovered;
   }
 
   // Private helper methods
