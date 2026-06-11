@@ -1,3 +1,4 @@
+import { Worker as ThreadWorker } from 'worker_threads';
 import logger from '../utils/logger';
 import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
@@ -23,7 +24,6 @@ export class TaskExecutor {
    */
   static async execute(workerId: string, task: Task): Promise<void> {
     const startTime = Date.now();
-    let timeoutHandle: NodeJS.Timeout | undefined;
 
     try {
       // Validate handler exists
@@ -45,15 +45,76 @@ export class TaskExecutor {
 
       await WorkerPool.updateWorkerStatus(workerId, 'busy');
 
-      // Execute with timeout
-      const result = await Promise.race([
-        handler(task.payload),
-        new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            reject(new Error(`Task execution timeout after ${task.timeout}ms`));
-          }, task.timeout);
-        }),
-      ]);
+      // Execute handler in worker thread to support forceful termination
+      const result = await new Promise<any>((resolve, reject) => {
+        const handlerStr = handler.toString();
+        const workerCode = `
+          const { parentPort, workerData } = require('worker_threads');
+          
+          // Define a dummy logger in global scope to prevent crashes in handlers
+          const logger = {
+            info: (...args) => console.log(...args),
+            error: (...args) => console.error(...args),
+            warn: (...args) => console.warn(...args),
+            debug: (...args) => console.debug(...args),
+          };
+
+          async function run() {
+            try {
+              // Evaluate the handler function string
+              const handlerFn = eval(workerData.handlerStr);
+              const result = await handlerFn(workerData.payload);
+              parentPort.postMessage({ success: true, result });
+            } catch (error) {
+              parentPort.postMessage({
+                success: false,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            }
+          }
+          run();
+        `;
+
+        const worker = new ThreadWorker(workerCode, {
+          eval: true,
+          workerData: {
+            handlerStr,
+            payload: task.payload
+          }
+        });
+
+        let hasTimedOut = false;
+
+        const timeoutHandle = setTimeout(async () => {
+          hasTimedOut = true;
+          reject(new Error(`Task execution timeout after ${task.timeout}ms`));
+          await worker.terminate();
+        }, task.timeout);
+
+        worker.on('message', (msg) => {
+          if (hasTimedOut) return;
+          clearTimeout(timeoutHandle);
+          if (msg.success) {
+            resolve(msg.result);
+          } else {
+            reject(new Error(msg.error));
+          }
+        });
+
+        worker.on('error', (err) => {
+          if (hasTimedOut) return;
+          clearTimeout(timeoutHandle);
+          reject(err);
+        });
+
+        worker.on('exit', (code) => {
+          if (hasTimedOut) return;
+          clearTimeout(timeoutHandle);
+          if (code !== 0) {
+            reject(new Error(`Worker thread exited with code ${code}`));
+          }
+        });
+      });
 
       // Mark as completed
       await TaskQueue.updateTaskStatus(task.id, 'completed', {
@@ -104,8 +165,6 @@ export class TaskExecutor {
         });
       }
     } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-
       // Reflect the worker's actual state: it is only idle once it has no
       // remaining tasks. With concurrent execution, other tasks may still be
       // running when this one finishes, so the worker should stay busy.
