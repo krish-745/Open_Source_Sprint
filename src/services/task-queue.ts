@@ -108,6 +108,8 @@ export class TaskQueue {
       throw new Error(`Task ${taskId} not found`);
     }
 
+    const previousStatus = task.status;
+
     task.status = status;
     if (metadata) {
       Object.assign(task, metadata);
@@ -120,6 +122,12 @@ export class TaskQueue {
     }
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+    // Keep queue stats consistent as the task moves between states.
+    if (previousStatus !== status) {
+      await this._transitionQueueStats(task.queue, previousStatus, status);
+    }
+
     logger.info({ taskId, status }, 'Task status updated');
   }
 
@@ -171,7 +179,7 @@ export class TaskQueue {
 
     task.retries += 1;
     task.status = 'retry';
-    task.error = undefined;
+    delete task.error;
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
@@ -324,5 +332,34 @@ export class TaskQueue {
     const client = getRedisClient();
     const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
     await client.hIncrBy(statsKey, 'pending', increment);
+  }
+
+  // Task statuses that are tracked as queue stat counters.
+  private static readonly STATS_BUCKETS: ReadonlyArray<TaskStatus> = [
+    'pending',
+    'processing',
+    'completed',
+    'failed',
+  ];
+
+  /**
+   * Move a task between queue stat counters when its status changes,
+   * decrementing the previous bucket and incrementing the new one so the
+   * counters stay consistent (e.g. pending -> processing -> completed).
+   */
+  private static async _transitionQueueStats(
+    queueName: string,
+    from: TaskStatus,
+    to: TaskStatus
+  ): Promise<void> {
+    const client = getRedisClient();
+    const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
+
+    if (this.STATS_BUCKETS.includes(from)) {
+      await client.hIncrBy(statsKey, from, -1);
+    }
+    if (this.STATS_BUCKETS.includes(to)) {
+      await client.hIncrBy(statsKey, to, 1);
+    }
   }
 }
