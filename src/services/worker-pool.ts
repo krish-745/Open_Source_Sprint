@@ -152,6 +152,13 @@ export class WorkerPool {
     metrics: Partial<TaskExecutionMetrics>
   ): Promise<void> {
     const client = getRedisClient();
+    
+    const removed = await client.lRem(`worker:${workerId}:tasks`, 1, taskId);
+    if (removed === 0) {
+      // Task already removed (e.g. preempted)
+      return;
+    }
+
     const worker = await this.getWorker(workerId);
 
     if (!worker) {
@@ -168,7 +175,6 @@ export class WorkerPool {
     worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
 
     await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
-    await client.lRem(`worker:${workerId}:tasks`, 1, taskId);
 
     // Store metrics
     const metricsKey = `${METRICS_PREFIX}${workerId}:${Date.now()}`;
@@ -181,6 +187,22 @@ export class WorkerPool {
       }),
       { EX: 7 * 24 * 60 * 60 } // 7 days retention
     );
+  }
+
+  /**
+   * Preempt a task on a worker, freeing up its capacity without completing it
+   */
+  static async preemptTask(workerId: string, taskId: string): Promise<void> {
+    const client = getRedisClient();
+    const removed = await client.lRem(`worker:${workerId}:tasks`, 1, taskId);
+    if (removed > 0) {
+      const worker = await this.getWorker(workerId);
+      if (worker) {
+        worker.currentTasks = Math.max(0, worker.currentTasks - 1);
+        worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
+        await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+      }
+    }
   }
 
   /**

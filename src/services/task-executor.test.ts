@@ -55,4 +55,31 @@ describe('TaskExecutor.execute worker status', () => {
 
     expect(mockedWorkerPool.updateWorkerStatus).toHaveBeenLastCalledWith('w1', 'idle');
   });
+
+  it('does not mark the task as completed if it was preempted by another worker', async () => {
+    mockedWorkerPool.getWorker.mockResolvedValue({ currentTasks: 0 } as any);
+    
+    // Simulate that the task has been preempted and its workerId cleared or changed
+    mockedTaskQueue.getTask.mockResolvedValue(buildTask({ workerId: undefined }));
+
+    await TaskExecutor.execute('w1', buildTask());
+
+    // Should NOT call updateTaskStatus with 'completed'
+    expect(mockedTaskQueue.updateTaskStatus).not.toHaveBeenCalledWith('task-1', 'completed', expect.any(Object));
+    // Should still call completeTask to decrement the worker's internal tasks counter
+    expect(mockedWorkerPool.completeTask).toHaveBeenCalledWith('w1', 'task-1', expect.any(Object));
+  });
+
+  it('marks the task as completed if it was NOT preempted', async () => {
+    mockedWorkerPool.getWorker.mockResolvedValue({ currentTasks: 0 } as any);
+    
+    // Simulate that the task is still assigned to this worker
+    mockedTaskQueue.getTask.mockResolvedValue(buildTask({ workerId: 'w1' }));
+
+    await TaskExecutor.execute('w1', buildTask());
+
+    // Should call updateTaskStatus with 'completed'
+    expect(mockedTaskQueue.updateTaskStatus).toHaveBeenCalledWith('task-1', 'completed', expect.any(Object));
+    expect(mockedWorkerPool.completeTask).toHaveBeenCalledWith('w1', 'task-1', expect.any(Object));
+  });
 });
