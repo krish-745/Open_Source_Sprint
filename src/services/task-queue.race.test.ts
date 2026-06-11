@@ -40,6 +40,7 @@ function makeClient(taskJson: string | null, execImpl: jest.Mock) {
     unwatch: jest.fn().mockResolvedValue('OK'),
     get: jest.fn().mockResolvedValue(taskJson),
     multi: jest.fn().mockReturnValue(multi),
+    hIncrBy: jest.fn().mockResolvedValue(1),
     __setSpy: setSpy,
   };
   return client;
