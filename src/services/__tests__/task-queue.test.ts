@@ -8,6 +8,8 @@ jest.mock('../redis', () => {
     zAdd: jest.fn(),
     zCard: jest.fn(),
     hIncrBy: jest.fn(),
+    hSet: jest.fn(),
+    hGet: jest.fn(),
     lPush: jest.fn(),
     del: jest.fn(),
   };

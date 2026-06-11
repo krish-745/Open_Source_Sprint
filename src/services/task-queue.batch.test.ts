@@ -9,7 +9,9 @@ function makeClient() {
   return {
     set: jest.fn().mockResolvedValue('OK'),
     zAdd: jest.fn().mockResolvedValue(1),
+    zCard: jest.fn().mockResolvedValue(0),   // queue never full
     hIncrBy: jest.fn().mockResolvedValue(1),
+    hGet: jest.fn().mockResolvedValue(null), // no budget set → no enforcement
   } as any;
 }
 

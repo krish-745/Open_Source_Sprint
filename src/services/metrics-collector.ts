@@ -75,7 +75,8 @@ export class MetricsCollector {
     for (const key of queueKeys) {
       const queueName = key.replace('queue:', '').replace(':stats', '');
       const stats = await TaskQueue.getQueueStats(queueName);
-      metrics.queues[queueName] = stats;
+      const costPrediction = await TaskQueue.predictQueueCost(queueName);
+      metrics.queues[queueName] = { ...stats, costPrediction };
     }
 
     // Collect worker metrics
@@ -83,7 +84,8 @@ export class MetricsCollector {
     for (const workerId of workerIds) {
       try {
         const workerMetrics = await WorkerPool.getWorkerMetrics(workerId);
-        metrics.workers[workerId] = workerMetrics;
+        const costMetrics = await WorkerPool.getWorkerCostMetrics(workerId);
+        metrics.workers[workerId] = { ...workerMetrics, cost: costMetrics };
       } catch (error) {
         // Worker may not exist
       }

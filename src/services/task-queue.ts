@@ -20,6 +20,16 @@ export class QueueFullError extends Error {
   }
 }
 
+/**
+ * Thrown when a task's cost exceeds the caller's available budget.
+ */
+export class BudgetExceededError extends Error {
+  constructor(callerId: string, available: number, required: number) {
+    super(`Budget exceeded for caller ${callerId}: available ${available}, required ${required}`);
+    this.name = 'BudgetExceededError';
+  }
+}
+
 export class TaskQueue {
   /**
    * Create a new task and add it to the queue
@@ -50,6 +60,20 @@ export class TaskQueue {
 
     if (currentSize >= maxQueueSize) {
       throw new QueueFullError(queueName, maxQueueSize);
+    }
+
+    // Use ?? (not ||) so that an explicit cost of 0 is honoured as a free task.
+    // Clamp to >= 0 and fall back to 1 for non-finite/NaN values so invalid
+    // metadata never corrupts budget arithmetic.
+    const rawCost = options.metadata?.cost ?? 1;
+    const cost = Number.isFinite(rawCost) && rawCost >= 0 ? rawCost : 1;
+    const callerId = options.metadata?.callerId;
+
+    if (callerId) {
+      const budget = await this.getCallerBudget(callerId);
+      if (budget !== null && budget < cost) {
+        throw new BudgetExceededError(callerId, budget, cost);
+      }
     }
 
     const task: Task = {
@@ -84,6 +108,15 @@ export class TaskQueue {
 
     // Update queue metadata
     await this._updateQueueStats(queueName, 1);
+
+    // Deduct caller budget only after the task is fully persisted, so a
+    // write failure never silently drains budget without creating the task.
+    if (callerId) {
+      const budget = await this.getCallerBudget(callerId);
+      if (budget !== null) {
+        await client.hIncrBy('caller:budgets', callerId, -cost);
+      }
+    }
 
     logger.info({ taskId, queueName }, 'Task created');
     return task;
@@ -345,6 +378,47 @@ export class TaskQueue {
       logger.info({ recovered }, 'Orphaned tasks recovered');
     }
     return recovered;
+  }
+
+  /**
+   * Set budget for a caller
+   */
+  static async setCallerBudget(callerId: string, budget: number): Promise<void> {
+    const client = getRedisClient();
+    await client.hSet('caller:budgets', callerId, budget.toString());
+  }
+
+  /**
+   * Get budget for a caller
+   */
+  static async getCallerBudget(callerId: string): Promise<number | null> {
+    const client = getRedisClient();
+    const val = await client.hGet('caller:budgets', callerId);
+    return val ? parseInt(val, 10) : null;
+  }
+
+  /**
+   * Predict the total cost of all pending tasks in a queue
+   */
+  static async predictQueueCost(queueName: string): Promise<{ totalCost: number, taskCount: number }> {
+    const client = getRedisClient();
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const taskIds = await client.zRange(queueKey, 0, -1);
+    
+    let totalCost = 0;
+    let taskCount = 0;
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (task) {
+        // Use ?? so that explicitly free tasks (cost=0) are counted as 0.
+        // Clamp negatives/NaN to 1 for consistent prediction.
+        const rawCost = task.metadata?.cost ?? 1;
+        totalCost += Number.isFinite(rawCost) && rawCost >= 0 ? rawCost : 1;
+        taskCount++;
+      }
+    }
+    
+    return { totalCost, taskCount };
   }
 
   // Private helper methods
