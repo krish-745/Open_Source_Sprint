@@ -228,6 +228,41 @@ export class TaskQueue {
     return deleted;
   }
 
+  /**
+   * Reclaim and reassign tasks that were assigned to a worker that went offline
+   */
+  static async reclaimStuckTasks(workerId: string): Promise<number> {
+    const client = getRedisClient();
+    const taskIds = await client.lRange(`worker:${workerId}:tasks`, 0, -1);
+    let reclaimedCount = 0;
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (task && task.status === 'processing') {
+        logger.warn({ taskId, workerId }, 'Reclaiming stuck task from offline worker');
+
+        // Clear worker assignment
+        task.workerId = undefined;
+        await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+        // Attempt retry (reassign) or mark as failed
+        const retried = await this.retryTask(taskId);
+        if (!retried) {
+          // If no retries left, transition status to failed
+          await this.updateTaskStatus(taskId, 'failed', {
+            error: 'Worker disconnected during task execution',
+            completedAt: new Date(),
+          });
+        }
+        reclaimedCount++;
+      }
+    }
+
+    // Clear worker's tasks list
+    await client.del(`worker:${workerId}:tasks`);
+    return reclaimedCount;
+  }
+
   // Private helper methods
 
   private static _calculateQueueScore(priority: string): number {

@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
 import { Worker, WorkerStatus, Task, TaskExecutionMetrics } from '../types';
+import { TaskQueue } from './task-queue';
 
 const WORKER_PREFIX = 'worker:';
 const WORKERS_INDEX = 'workers:index';
@@ -193,11 +194,21 @@ export class WorkerPool {
 
     for (const workerId of allWorkers) {
       const worker = await this.getWorker(workerId);
-      if (worker && now - new Date(worker.lastHeartbeat).getTime() > timeout) {
+      if (
+        worker &&
+        worker.status !== 'offline' &&
+        now - new Date(worker.lastHeartbeat).getTime() > timeout
+      ) {
         worker.status = 'offline';
+        worker.currentTasks = 0;
+        worker.capacity = 0;
         await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+
+        // Reclaim any stuck tasks assigned to this worker
+        await TaskQueue.reclaimStuckTasks(workerId);
+
         staleCount++;
-        logger.warn({ workerId }, 'Worker marked as offline');
+        logger.warn({ workerId }, 'Worker marked as offline and stuck tasks reclaimed');
       }
     }
 
