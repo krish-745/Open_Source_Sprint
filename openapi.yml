@@ -1,0 +1,852 @@
+openapi: 3.0.3
+info:
+  title: TaskFlow - Distributed Task Scheduler API
+  description: |
+    API documentation for TaskFlow, a production-grade distributed task scheduling and execution framework
+    with real-time monitoring, worker pool management, and task dependency support.
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+paths:
+  /api/tasks:
+    post:
+      summary: Create a new task
+      description: Creates a new task, adds it to the index, and places it on the specified queue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - handler
+              properties:
+                name:
+                  type: string
+                  example: Process Data
+                handler:
+                  type: string
+                  example: dataProcessor
+                payload:
+                  type: object
+                  description: Task payload dictionary
+                  example: { "dataset": "large_file.csv" }
+                queueName:
+                  type: string
+                  default: default
+                  example: default
+                priority:
+                  type: string
+                  enum: [low, medium, high, critical]
+                  default: medium
+                  example: high
+                maxRetries:
+                  type: integer
+                  default: 3
+                  example: 3
+                timeout:
+                  type: integer
+                  description: Execution timeout in milliseconds
+                  default: 30000
+                  example: 60000
+                tags:
+                  type: array
+                  items:
+                    type: string
+                  example: ["cpu-intensive"]
+      responses:
+        '201':
+          description: Task successfully created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          description: Invalid request payload or unknown handler
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/tasks/search:
+    get:
+      summary: Search tasks
+      description: Search across all task names and descriptions case-insensitively with relevance scoring.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search term query string
+          schema:
+            type: string
+          example: report
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of search results to return
+          schema:
+            type: integer
+            default: 50
+          example: 10
+      responses:
+        '200':
+          description: List of matching task IDs with relevance scores
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    taskId:
+                      type: string
+                      format: uuid
+                    score:
+                      type: integer
+                      description: Relevance score based on matching weights
+                  example:
+                    taskId: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
+                    score: 7
+        '400':
+          description: Missing query parameter q
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/tasks/{taskId}:
+    get:
+      summary: Get task details by ID
+      description: Retrieves the detailed task state by its unique ID.
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+      responses:
+        '200':
+          description: Detailed task information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Task not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/queues/{queueName}/tasks:
+    get:
+      summary: Get tasks in a queue
+      description: Returns paginated tasks and stats for a specific queue, with optional filter parameters.
+      parameters:
+        - name: queueName
+          in: path
+          required: true
+          schema:
+            type: string
+          example: default
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+          example: 10
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+          example: 0
+        - name: status
+          in: query
+          required: false
+          description: Comma-separated list of statuses to filter by (e.g. pending,processing)
+          schema:
+            type: string
+          example: pending,processing
+        - name: priority
+          in: query
+          required: false
+          description: Comma-separated list of priorities to filter by (e.g. high,critical)
+          schema:
+            type: string
+          example: high,critical
+        - name: tags
+          in: query
+          required: false
+          description: Comma-separated list of tags to filter by. Tasks must match all tags.
+          schema:
+            type: string
+          example: cpu-intensive,report
+        - name: startDate
+          in: query
+          required: false
+          description: ISO 8601 date string. Filter tasks created on or after this date.
+          schema:
+            type: string
+            format: date-time
+          example: "2026-06-11T12:00:00Z"
+        - name: endDate
+          in: query
+          required: false
+          description: ISO 8601 date string. Filter tasks created on or before this date.
+          schema:
+            type: string
+            format: date-time
+          example: "2026-06-11T18:00:00Z"
+      responses:
+        '200':
+          description: List of tasks and queue statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+                  stats:
+                    type: object
+                    properties:
+                      queueName:
+                        type: string
+                      queueSize:
+                        type: integer
+                      pending:
+                        type: integer
+                      processing:
+                        type: integer
+                      completed:
+                        type: integer
+                      failed:
+                        type: integer
+                    example:
+                      queueName: default
+                      queueSize: 2
+                      pending: 1
+                      processing: 1
+                      completed: 10
+                      failed: 0
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/workers:
+    post:
+      summary: Register a new worker
+      description: Registers a new active worker process into the worker pool.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - handlers
+              properties:
+                name:
+                  type: string
+                  example: Worker-1
+                handlers:
+                  type: array
+                  items:
+                    type: string
+                  example: ["dataProcessor", "emailSender"]
+                maxConcurrent:
+                  type: integer
+                  default: 5
+                  example: 5
+                version:
+                  type: string
+                  default: 1.0.0
+                  example: 1.0.0
+                tags:
+                  type: array
+                  items:
+                    type: string
+                  example: ["cpu-intensive"]
+      responses:
+        '201':
+          description: Worker registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Worker'
+        '400':
+          description: Missing required fields name or handlers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/workers/{workerId}:
+    get:
+      summary: Get worker details
+      description: Retrieves a worker's registration details by ID.
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: 1a9f1a23-4567-89ab-cdef-0123456789ab
+      responses:
+        '200':
+          description: Worker registration details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Worker'
+        '404':
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/workers/{workerId}/metrics:
+    get:
+      summary: Get worker performance metrics
+      description: Retrieves detailed metrics for a worker including total tasks processed, success rates, and capacities.
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: 1a9f1a23-4567-89ab-cdef-0123456789ab
+      responses:
+        '200':
+          description: Worker metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workerId:
+                    type: string
+                    format: uuid
+                  name:
+                    type: string
+                  status:
+                    type: string
+                  currentTasks:
+                    type: integer
+                  totalProcessed:
+                    type: integer
+                  totalFailed:
+                    type: integer
+                  successRate:
+                    type: string
+                  capacity:
+                    type: integer
+                  handlers:
+                    type: array
+                    items:
+                      type: string
+                  lastHeartbeat:
+                    type: string
+                    format: date-time
+                example:
+                  workerId: "1a9f1a23-4567-89ab-cdef-0123456789ab"
+                  name: Worker-1
+                  status: busy
+                  currentTasks: 2
+                  totalProcessed: 10
+                  totalFailed: 1
+                  successRate: "90.00"
+                  capacity: 40
+                  handlers: ["dataProcessor"]
+                  lastHeartbeat: "2026-06-11T12:00:00.000Z"
+        '404':
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/workers/{workerId}/heartbeat:
+    post:
+      summary: Send worker heartbeat
+      description: Refreshes a worker's lastHeartbeat timestamp to prevent it from being marked stale/offline.
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: 1a9f1a23-4567-89ab-cdef-0123456789ab
+      responses:
+        '200':
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                example:
+                  success: true
+        '404':
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/workers/{workerId}/unregister:
+    post:
+      summary: Unregister worker
+      description: Unregisters a worker and removes it from the pool.
+      parameters:
+        - name: workerId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: 1a9f1a23-4567-89ab-cdef-0123456789ab
+      responses:
+        '200':
+          description: Worker successfully unregistered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                example:
+                  success: true
+        '404':
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/health:
+    get:
+      summary: Health check endpoint
+      description: Assesses the health of the system based on online workers, dead letter queue size, and metrics availability.
+      responses:
+        '200':
+          description: System health report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, degraded, critical, unknown, error]
+                  workers:
+                    type: object
+                    properties:
+                      online:
+                        type: integer
+                      total:
+                        type: integer
+                  queues:
+                    type: integer
+                  dlqSize:
+                    type: integer
+                  issues:
+                    type: array
+                    items:
+                      type: string
+                  timestamp:
+                    type: string
+                    format: date-time
+                example:
+                  status: healthy
+                  workers:
+                    online: 2
+                    total: 2
+                  queues: 1
+                  dlqSize: 0
+                  issues: []
+                  timestamp: "2026-06-11T12:05:00.000Z"
+        '500':
+          description: Internal check error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/metrics:
+    get:
+      summary: Get latest system metrics snapshot
+      description: Retrieves the most recent system metrics snapshot containing state summaries for queues, workers, and tasks.
+      responses:
+        '200':
+          description: System metrics snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemMetrics'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/metrics/queues:
+    get:
+      summary: Get detailed queue metrics
+      description: Retrieves queue-specific statistics from the latest snapshot.
+      responses:
+        '200':
+          description: Detailed queue metrics map
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    queueName:
+                      type: string
+                    queueSize:
+                      type: integer
+                    pending:
+                      type: integer
+                    processing:
+                      type: integer
+                    completed:
+                      type: integer
+                    failed:
+                      type: integer
+                example:
+                  default:
+                    queueName: default
+                    queueSize: 1
+                    pending: 0
+                    processing: 1
+                    completed: 5
+                    failed: 0
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/metrics/workers:
+    get:
+      summary: Get worker performance metrics list
+      description: Retrieves worker performance metrics sorted by efficiency from the latest snapshot.
+      responses:
+        '200':
+          description: List of worker performance details
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    workerId:
+                      type: string
+                      format: uuid
+                    name:
+                      type: string
+                    status:
+                      type: string
+                    currentTasks:
+                      type: integer
+                    totalProcessed:
+                      type: integer
+                    totalFailed:
+                      type: integer
+                    successRate:
+                      type: string
+                    capacity:
+                      type: integer
+                    handlers:
+                      type: array
+                      items:
+                        type: string
+                    lastHeartbeat:
+                      type: string
+                      format: date-time
+                    efficiency:
+                      type: number
+                  example:
+                    workerId: "1a9f1a23-4567-89ab-cdef-0123456789ab"
+                    name: Worker-1
+                    status: idle
+                    currentTasks: 0
+                    totalProcessed: 15
+                    totalFailed: 0
+                    successRate: "100.00"
+                    capacity: 0
+                    handlers: ["dataProcessor"]
+                    lastHeartbeat: "2026-06-11T12:00:00.000Z"
+                    efficiency: 1.0
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/cleanup:
+    post:
+      summary: Clean up old completed/failed tasks
+      description: Deletes task objects and indices that were completed or failed prior to the specified hour limit.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                hoursAgo:
+                  type: integer
+                  default: 24
+                  example: 12
+      responses:
+        '200':
+          description: Cleanup completed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+                  hoursAgo:
+                    type: integer
+                example:
+                  deleted: 5
+                  hoursAgo: 12
+        '500':
+          description: Cleanup error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    Task:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+        status:
+          type: string
+          enum: [pending, queued, processing, completed, failed, retry, cancelled, blocked]
+        handler:
+          type: string
+        payload:
+          type: object
+        retries:
+          type: integer
+        maxRetries:
+          type: integer
+        timeout:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        startedAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        error:
+          type: string
+        result:
+          type: object
+        workerId:
+          type: string
+          format: uuid
+        queue:
+          type: string
+        dependencies:
+          type: array
+          items:
+            type: string
+        tags:
+          type: array
+          items:
+            type: string
+      example:
+        id: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+        name: Process Data
+        description: Task: Process Data
+        priority: high
+        status: pending
+        handler: dataProcessor
+        payload: { "dataset": "large_file.csv" }
+        retries: 0
+        maxRetries: 3
+        timeout: 60000
+        createdAt: "2026-06-11T12:00:00.000Z"
+        queue: default
+        dependencies: []
+        tags: ["cpu-intensive"]
+
+    Worker:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        status:
+          type: string
+          enum: [online, offline, busy, idle, maintenance]
+        handlers:
+          type: array
+          items:
+            type: string
+        maxConcurrent:
+          type: integer
+        currentTasks:
+          type: integer
+        totalProcessed:
+          type: integer
+        totalFailed:
+          type: integer
+        lastHeartbeat:
+          type: string
+          format: date-time
+        registeredAt:
+          type: string
+          format: date-time
+        version:
+          type: string
+        capacity:
+          type: integer
+        tags:
+          type: array
+          items:
+            type: string
+      example:
+        id: 1a9f1a23-4567-89ab-cdef-0123456789ab
+        name: Worker-1
+        status: online
+        handlers: ["dataProcessor", "emailSender"]
+        maxConcurrent: 5
+        currentTasks: 0
+        totalProcessed: 0
+        totalFailed: 0
+        lastHeartbeat: "2026-06-11T12:00:00.000Z"
+        registeredAt: "2026-06-11T12:00:00.000Z"
+        version: 1.0.0
+        capacity: 0
+        tags: ["cpu-intensive"]
+
+    SystemMetrics:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        queues:
+          type: object
+        workers:
+          type: object
+        tasks:
+          type: object
+        system:
+          type: object
+      example:
+        timestamp: "2026-06-11T12:00:00.000Z"
+        queues: {}
+        workers: {}
+        tasks:
+          totalInSystem: 10
+          deadLetterQueueSize: 0
+        system:
+          memoryUsage: { "rss": 49356800 }
+          uptime: 3600.5
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      example:
+        error: "Resource not found"
