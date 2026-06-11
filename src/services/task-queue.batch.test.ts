@@ -10,6 +10,9 @@ function makeClient() {
     set: jest.fn().mockResolvedValue('OK'),
     zAdd: jest.fn().mockResolvedValue(1),
     hIncrBy: jest.fn().mockResolvedValue(1),
+    zCard: jest.fn().mockResolvedValue(0),
+    sAdd: jest.fn().mockResolvedValue(1),
+    expire: jest.fn().mockResolvedValue(1),
   } as any;
 }
 

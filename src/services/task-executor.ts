@@ -55,11 +55,17 @@ export class TaskExecutor {
         }),
       ]);
 
-      // Mark as completed
-      await TaskQueue.updateTaskStatus(task.id, 'completed', {
-        result,
-        completedAt: new Date(),
-      });
+      // Check if task was preempted before updating status
+      const currentTask = await TaskQueue.getTask(task.id);
+      if (currentTask && currentTask.workerId !== workerId) {
+        logger.warn({ taskId: task.id }, 'Task was preempted by another worker. Discarding result.');
+      } else {
+        // Mark as completed
+        await TaskQueue.updateTaskStatus(task.id, 'completed', {
+          result,
+          completedAt: new Date(),
+        });
+      }
 
       const duration = Date.now() - startTime;
       await WorkerPool.completeTask(workerId, task.id, {
@@ -77,31 +83,37 @@ export class TaskExecutor {
 
       logger.error({ taskId: task.id, error: errorMessage, duration }, 'Task execution failed');
 
-      // Attempt retry
-      const retried = await TaskQueue.retryTask(task.id);
-
-      if (retried) {
-        await WorkerPool.completeTask(workerId, task.id, {
-          duration,
-          success: false,
-          retriesUsed: task.retries,
-          memory: 0,
-          cpu: 0,
-        });
+      // Check if task was preempted before doing retry/DLQ logic
+      const currentTask = await TaskQueue.getTask(task.id);
+      if (currentTask && currentTask.workerId !== workerId) {
+        logger.warn({ taskId: task.id }, 'Task was preempted. Ignoring execution failure.');
       } else {
-        // Move to dead letter queue
-        await TaskQueue.updateTaskStatus(task.id, 'failed', {
-          error: errorMessage,
-          completedAt: new Date(),
-        });
+        // Attempt retry
+        const retried = await TaskQueue.retryTask(task.id);
 
-        await WorkerPool.completeTask(workerId, task.id, {
-          duration,
-          success: false,
-          retriesUsed: task.retries,
-          memory: 0,
-          cpu: 0,
-        });
+        if (retried) {
+          await WorkerPool.completeTask(workerId, task.id, {
+            duration,
+            success: false,
+            retriesUsed: task.retries,
+            memory: 0,
+            cpu: 0,
+          });
+        } else {
+          // Move to dead letter queue
+          await TaskQueue.updateTaskStatus(task.id, 'failed', {
+            error: errorMessage,
+            completedAt: new Date(),
+          });
+
+          await WorkerPool.completeTask(workerId, task.id, {
+            duration,
+            success: false,
+            retriesUsed: task.retries,
+            memory: 0,
+            cpu: 0,
+          });
+        }
       }
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);

@@ -93,10 +93,19 @@ export class MetricsCollector {
     const taskIndexSize = await client.zCard('tasks:index');
     const dlqSize = await client.lLen('dlq:tasks');
 
+    const slaViolationsRaw = await client.hGetAll('metrics:sla_violations');
+    const slaViolations = {
+      critical: parseInt(slaViolationsRaw.critical || '0'),
+      high: parseInt(slaViolationsRaw.high || '0'),
+      medium: parseInt(slaViolationsRaw.medium || '0'),
+      low: parseInt(slaViolationsRaw.low || '0'),
+    };
+
     metrics.tasks = {
       totalInSystem: taskIndexSize,
       deadLetterQueueSize: dlqSize,
     };
+    metrics.system.slaViolations = slaViolations;
 
     // Store snapshot
     const snapshotKey = `${SNAPSHOT_PREFIX}${Date.now()}`;

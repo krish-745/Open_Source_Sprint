@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
 import { TaskQueue } from './task-queue';
+import { WorkerPool } from './worker-pool';
 
 const SCHEDULED_TASKS_KEY = 'scheduled:tasks';
 const SCHEDULER_LOCK = 'scheduler:lock';
@@ -106,6 +107,7 @@ export class TaskScheduler {
         // Get all tasks due to run
         const dueTasks = await client.zRange(SCHEDULED_TASKS_KEY, 0, now, { BY: 'SCORE' });
 
+        // Process scheduled tasks
         for (const taskData of dueTasks) {
           try {
             const { taskId } = JSON.parse(taskData);
@@ -126,6 +128,9 @@ export class TaskScheduler {
         // Recover tasks orphaned by crashed workers while holding the lock.
         await TaskQueue.recoverStaleTasks();
 
+        // Enforce SLA across all tasks
+        await TaskScheduler.enforceSLA();
+
         // Release lock
         const currentLock = await client.get(lockKey);
         if (currentLock === lockId) {
@@ -141,6 +146,106 @@ export class TaskScheduler {
 
     // Start the polling loop
     processScheduledTasks();
+  }
+
+  /**
+   * Enforce SLA across all tasks
+   * 1. Finds pending/queued tasks that violate their SLA
+   * 2. Preempts processing low-priority tasks if high/critical SLA is violated
+   */
+  static async enforceSLA(): Promise<void> {
+    const client = getRedisClient();
+    const queues = await client.keys('queue:*');
+    
+    const totalViolations = {
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0
+    };
+
+    const PRIORITY_SLA = {
+      critical: 5000,
+      high: 15000,
+      medium: 60000,
+      low: 300000,
+    };
+
+    const now = Date.now();
+
+    for (const queueKey of queues) {
+      if (queueKey.endsWith(':stats')) continue;
+      const queueName = queueKey.replace('queue:', '');
+
+      // Get queued tasks
+      const taskIds = await client.zRange(queueKey, 0, -1);
+      
+      let hasHighPriorityAtRisk = false;
+
+      for (const taskId of taskIds) {
+        const task = await TaskQueue.getTask(taskId);
+        if (!task || (task.status !== 'queued' && task.status !== 'pending' && task.status !== 'retry')) continue;
+
+        // Ensure task is actually runnable (not blocked by dependencies or scheduled for the future)
+        if (task.dependencies && task.dependencies.length > 0) {
+          const depsResolved = await (TaskQueue as any)._checkDependencies(task.dependencies);
+          if (!depsResolved) continue;
+        }
+        if (task.scheduledFor && new Date(task.scheduledFor).getTime() > now) {
+          continue;
+        }
+
+        const sla = PRIORITY_SLA[task.priority as keyof typeof PRIORITY_SLA] || 60000;
+        const taskAge = now - new Date(task.createdAt).getTime();
+
+        if (taskAge > sla) {
+          // Check if we already recorded this violation
+          if (!task.metadata?.slaViolated) {
+            totalViolations[task.priority as keyof typeof PRIORITY_SLA]++;
+            logger.warn({ taskId, priority: task.priority, age: taskAge, sla }, 'SLA Violated');
+            
+            task.metadata = task.metadata || {};
+            task.metadata.slaViolated = true;
+            await client.set(`task:${task.id}`, JSON.stringify(task));
+          }
+          
+          if (task.priority === 'critical' || task.priority === 'high') {
+            hasHighPriorityAtRisk = true;
+          }
+        }
+      }
+
+      // Preempt low priority tasks if high/critical is at risk
+      if (hasHighPriorityAtRisk) {
+        // Query active workers instead of all historical tasks (fixes massive N+1 performance bug)
+        const allWorkers = await client.zRange('workers:index', 0, -1);
+        for (const workerId of allWorkers) {
+          const activeTasks = await client.lRange(`worker:${workerId}:tasks`, 0, -1);
+          for (const tid of activeTasks) {
+            const t = await TaskQueue.getTask(tid);
+            if (t && t.status === 'processing' && (t.priority === 'low' || t.priority === 'medium') && t.queue === queueName) {
+              logger.warn({ taskId: t.id }, 'Preempting task to free resources for high-priority SLA risk');
+              const previousWorkerId = t.workerId;
+              await TaskQueue.updateTaskStatus(t.id, 'pending', { workerId: undefined, startedAt: undefined });
+              
+              if (previousWorkerId) {
+                await WorkerPool.preemptTask(previousWorkerId, t.id);
+              }
+
+              const score = t.priority === 'low' ? 1 : 10;
+              await client.zAdd(queueKey, { score: score + Math.random(), value: t.id });
+            }
+          }
+        }
+      }
+    }
+
+    // Update Redis metric
+    for (const [priority, count] of Object.entries(totalViolations)) {
+      if (count > 0) {
+        await client.hIncrBy('metrics:sla_violations', priority, count);
+      }
+    }
   }
 
   /**
