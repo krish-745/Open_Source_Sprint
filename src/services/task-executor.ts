@@ -2,6 +2,7 @@ import logger from '../utils/logger';
 import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
+import { deliverCallback } from './task-callbacks';
 
 export interface TaskHandler {
   (payload: Record<string, any>): Promise<any>;
@@ -69,6 +70,11 @@ export class TaskExecutor {
         memory: 0,
         cpu: 0,
       });
+
+      // Best-effort: POST the result to the task's callback URL if set.
+      if (task.callbackUrl) {
+        await deliverCallback({ ...task, status: 'completed', completedAt: new Date() }, result);
+      }
 
       logger.info({ taskId: task.id, duration }, 'Task completed successfully');
     } catch (error: any) {

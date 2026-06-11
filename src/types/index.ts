@@ -22,6 +22,7 @@ export interface Task {
   queue: string;
   dependencies: string[]; // Task IDs this task depends on
   scheduledFor?: Date; // For delayed tasks
+  callbackUrl?: string; // Optional webhook to POST the result to on completion
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
