@@ -47,6 +47,46 @@ router.post('/tasks', async (req: Request, res: Response) => {
   }
 });
 
+router.post('/tasks/batch', async (req: Request, res: Response) => {
+  try {
+    const { tasks } = req.body;
+
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+      return res.status(400).json({ error: 'tasks must be a non-empty array' });
+    }
+
+    // Validate everything before creating anything.
+    for (const [index, t] of tasks.entries()) {
+      if (!t.name || !t.handler) {
+        return res.status(400).json({ error: `Invalid task at index ${index}: name and handler are required` });
+      }
+      if (!TaskExecutor.hasHandler(t.handler)) {
+        return res.status(400).json({ error: `Unknown handler at index ${index}: ${t.handler}` });
+      }
+    }
+
+    const created = await TaskQueue.createTasksBatch(
+      tasks.map((t: any) => ({
+        name: t.name,
+        handler: t.handler,
+        payload: t.payload,
+        options: {
+          queueName: t.queueName,
+          priority: t.priority,
+          maxRetries: t.maxRetries,
+          timeout: t.timeout,
+          tags: t.tags,
+        },
+      }))
+    );
+
+    res.status(201).json({ count: created.length, taskIds: created.map((t) => t.id) });
+  } catch (error: any) {
+    logger.error({ error }, 'Batch create error');
+    res.status(400).json({ error: error.message });
+  }
+});
+
 router.get('/tasks/:taskId', async (req: Request, res: Response) => {
   try {
     const { taskId } = req.params;

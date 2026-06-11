@@ -72,6 +72,43 @@ export class TaskQueue {
   }
 
   /**
+   * Create multiple tasks in one call.
+   *
+   * Validates every input up front (non-empty, within the 1000-task limit, each
+   * with a name and handler) so the batch is rejected before anything is
+   * written if any entry is invalid. Returns the created tasks in order.
+   */
+  static async createTasksBatch(
+    inputs: Array<{
+      name: string;
+      handler: string;
+      payload?: Record<string, any>;
+      options?: Parameters<typeof TaskQueue.createTask>[3];
+    }>
+  ): Promise<Task[]> {
+    if (inputs.length === 0) {
+      throw new Error('Batch must contain at least one task');
+    }
+    if (inputs.length > 1000) {
+      throw new Error('Batch size exceeds the maximum of 1000 tasks');
+    }
+
+    inputs.forEach((input, index) => {
+      if (!input.name || !input.handler) {
+        throw new Error(`Invalid task at index ${index}: name and handler are required`);
+      }
+    });
+
+    const created: Task[] = [];
+    for (const input of inputs) {
+      created.push(await this.createTask(input.name, input.handler, input.payload || {}, input.options || {}));
+    }
+
+    logger.info({ count: created.length }, 'Batch of tasks created');
+    return created;
+  }
+
+  /**
    * Get task by ID
    */
   static async getTask(taskId: string): Promise<Task | null> {
