@@ -274,6 +274,7 @@ export class TaskQueue {
       processing: parseInt(stats.processing || '0'),
       completed: parseInt(stats.completed || '0'),
       failed: parseInt(stats.failed || '0'),
+      rateLimitViolations: parseInt(stats.rateLimitViolations || '0'),
     };
   }
 
@@ -345,6 +346,108 @@ export class TaskQueue {
       logger.info({ recovered }, 'Orphaned tasks recovered');
     }
     return recovered;
+  }
+
+  /**
+   * Configure rate limit for a queue (max tasks per second)
+   */
+  static async configureRateLimit(queueName: string, maxTasksPerSecond: number): Promise<void> {
+    const client = getRedisClient();
+    const configKey = `${QUEUE_PREFIX}${queueName}:config`;
+    await client.hSet(configKey, 'rateLimit', maxTasksPerSecond.toString());
+  }
+
+  /**
+   * Get the configured rate limit for a queue. Returns null if not configured.
+   */
+  static async getRateLimit(queueName: string): Promise<number | null> {
+    const client = getRedisClient();
+    const configKey = `${QUEUE_PREFIX}${queueName}:config`;
+    const rateLimitStr = await client.hGet(configKey, 'rateLimit');
+    if (!rateLimitStr) return null;
+    const limit = parseInt(rateLimitStr, 10);
+    return isNaN(limit) ? null : limit;
+  }
+
+  /**
+   * Consume a token from the token bucket for the queue. Returns true if allowed.
+   */
+  static async consumeRateLimitToken(queueName: string, workerId?: string): Promise<boolean> {
+    if (!queueName) return true; // Guard against empty queue name
+
+    const client = getRedisClient();
+    const configKey = `${QUEUE_PREFIX}${queueName}:config`;
+    const rateLimitStr = await client.hGet(configKey, 'rateLimit');
+    
+    if (!rateLimitStr) return true; // No rate limit configured
+    
+    const limit = parseInt(rateLimitStr, 10);
+    if (limit <= 0) return false;
+    
+    // Lua script: atomically compute token bucket and consume one token if available.
+    // On denial, does NOT update the timestamp so the refill window is not artificially advanced.
+    const luaScript = `
+      local tokens_key = KEYS[1]
+      local timestamp_key = KEYS[2]
+      local rate = tonumber(ARGV[1])
+      local capacity = tonumber(ARGV[2])
+      local now = tonumber(ARGV[3])
+      local ttl = tonumber(ARGV[4])
+      
+      local tokens = tonumber(redis.call('get', tokens_key))
+      if tokens == nil then
+        tokens = capacity
+      end
+      
+      local last_refill = tonumber(redis.call('get', timestamp_key))
+      if last_refill == nil then
+        last_refill = now
+      end
+      
+      local delta = math.max(0, now - last_refill)
+      local refill = (delta / 1000) * rate
+      tokens = math.min(capacity, tokens + refill)
+      
+      if tokens >= 1 then
+        tokens = tokens - 1
+        redis.call('set', tokens_key, tokens)
+        redis.call('expire', tokens_key, ttl)
+        redis.call('set', timestamp_key, now)
+        redis.call('expire', timestamp_key, ttl)
+        return 1
+      else
+        -- On denial, persist the updated fractional token count but do NOT advance timestamp.
+        -- This ensures we don't steal refill time from the client on every failed attempt.
+        redis.call('set', tokens_key, tokens)
+        redis.call('expire', tokens_key, ttl)
+        return 0
+      end
+    `;
+    
+    // Per worker/queue combination
+    const tokensKey = workerId 
+      ? `${QUEUE_PREFIX}${queueName}:worker:${workerId}:tokens`
+      : `${QUEUE_PREFIX}${queueName}:tokens`;
+      
+    const timestampKey = workerId 
+      ? `${QUEUE_PREFIX}${queueName}:worker:${workerId}:last_refill`
+      : `${QUEUE_PREFIX}${queueName}:last_refill`;
+    
+    // TTL = 2x the replenish window (1 second per token at 1 task/sec rate, use 60s safety margin)
+    const ttlSeconds = Math.max(60, Math.ceil(limit * 2));
+
+    const result = await client.eval(luaScript, {
+      keys: [tokensKey, timestampKey],
+      arguments: [limit.toString(), limit.toString(), Date.now().toString(), ttlSeconds.toString()]
+    });
+    
+    if (result === 1) {
+      return true;
+    } else {
+      const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
+      await client.hIncrBy(statsKey, 'rateLimitViolations', 1);
+      return false;
+    }
   }
 
   // Private helper methods

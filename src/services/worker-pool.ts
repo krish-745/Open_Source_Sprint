@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
 import { Worker, WorkerStatus, Task, TaskExecutionMetrics } from '../types';
+import { TaskQueue } from './task-queue';
 
 const WORKER_PREFIX = 'worker:';
 const WORKERS_INDEX = 'workers:index';
@@ -132,6 +133,11 @@ export class WorkerPool {
 
     if (!worker) {
       throw new Error(`Worker ${workerId} not found`);
+    }
+
+    const allowed = await TaskQueue.consumeRateLimitToken(task.queue, workerId);
+    if (!allowed) {
+      throw new Error(`Rate limit exceeded for worker ${workerId} on queue ${task.queue}`);
     }
 
     worker.currentTasks++;
