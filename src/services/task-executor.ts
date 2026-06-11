@@ -1,10 +1,17 @@
-import logger from '../utils/logger';
+import logger, { withTrace } from '../utils/logger';
 import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
 
+export interface TaskContext {
+  taskId: string;
+  traceId?: string;
+  /** spanId of the parent task; pass this as `parentSpanId` when creating child tasks. */
+  parentSpanId?: string;
+}
+
 export interface TaskHandler {
-  (payload: Record<string, any>): Promise<any>;
+  (payload: Record<string, any>, context: TaskContext): Promise<any>;
 }
 
 export class TaskExecutor {
@@ -46,8 +53,13 @@ export class TaskExecutor {
       await WorkerPool.updateWorkerStatus(workerId, 'busy');
 
       // Execute with timeout
+      const context: TaskContext = {
+        taskId: task.id,
+        traceId: task.traceId,
+        parentSpanId: task.parentSpanId,
+      };
       const result = await Promise.race([
-        handler(task.payload),
+        handler(task.payload, context),
         new Promise<never>((_, reject) => {
           timeoutHandle = setTimeout(() => {
             reject(new Error(`Task execution timeout after ${task.timeout}ms`));
@@ -70,12 +82,18 @@ export class TaskExecutor {
         cpu: 0,
       });
 
-      logger.info({ taskId: task.id, duration }, 'Task completed successfully');
+      const tlog = task.traceId
+        ? withTrace({ trace_id: task.traceId, span_id: task.id, parent_span_id: task.parentSpanId })
+        : logger;
+      tlog.info({ taskId: task.id, duration }, 'Task completed successfully');
     } catch (error: any) {
       const duration = Date.now() - startTime;
       const errorMessage = error?.message || String(error);
 
-      logger.error({ taskId: task.id, error: errorMessage, duration }, 'Task execution failed');
+      const tlog = task.traceId
+        ? withTrace({ trace_id: task.traceId, span_id: task.id, parent_span_id: task.parentSpanId })
+        : logger;
+      tlog.error({ taskId: task.id, error: errorMessage, duration }, 'Task execution failed');
 
       // Attempt retry
       const retried = await TaskQueue.retryTask(task.id);

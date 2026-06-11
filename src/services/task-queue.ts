@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getRedisClient } from './redis';
-import logger from '../utils/logger';
+import logger, { withTrace } from '../utils/logger';
 import { Task, TaskStatus, Queue, RecurrenceRule } from '../types';
 
 const TASK_PREFIX = 'task:';
@@ -8,6 +8,8 @@ const QUEUE_PREFIX = 'queue:';
 const QUEUE_LIST_KEY = 'queues:all';
 const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
+/** TTL (seconds) for trace-index Redis sets — matches 7-day task retention. */
+const TRACE_INDEX_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 /**
  * Thrown when a queue has reached its maximum capacity (backpressure).
@@ -38,6 +40,8 @@ export class TaskQueue {
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
+      traceId?: string;
+      parentSpanId?: string;
     } = {}
   ): Promise<Task> {
     const client = getRedisClient();
@@ -50,6 +54,26 @@ export class TaskQueue {
 
     if (currentSize >= maxQueueSize) {
       throw new QueueFullError(queueName, maxQueueSize);
+    }
+
+    let traceId = options.traceId;
+    let parentSpanId = options.parentSpanId;
+    if (options.dependencies && options.dependencies.length > 0) {
+      // Inherit trace context from the first dependency so the whole chain
+      // shares a single traceId and we can reconstruct the call tree.
+      const depTask = await this.getTask(options.dependencies[0]);
+      if (depTask) {
+        if (!traceId && depTask.traceId) {
+          traceId = depTask.traceId;
+        }
+        if (!parentSpanId) {
+          // The dependency task IS the parent span.
+          parentSpanId = depTask.id;
+        }
+      }
+    }
+    if (!traceId) {
+      traceId = uuidv4();
     }
 
     const task: Task = {
@@ -70,6 +94,8 @@ export class TaskQueue {
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
+      traceId,
+      ...(parentSpanId ? { parentSpanId } : {}),
     };
 
     // Store task
@@ -78,6 +104,11 @@ export class TaskQueue {
     // Add to task index
     await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
 
+    // Add to trace index (with TTL so sets don't accumulate indefinitely).
+    const traceKey = `trace:${traceId}`;
+    await client.sAdd(traceKey, taskId);
+    await client.expire(traceKey, TRACE_INDEX_TTL_SECONDS);
+
     // Add to queue
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
@@ -85,7 +116,8 @@ export class TaskQueue {
     // Update queue metadata
     await this._updateQueueStats(queueName, 1);
 
-    logger.info({ taskId, queueName }, 'Task created');
+    withTrace({ trace_id: traceId, span_id: taskId, parent_span_id: parentSpanId })
+      .info({ taskId, queueName }, 'Task created');
     return task;
   }
 
@@ -166,7 +198,12 @@ export class TaskQueue {
       await this._transitionQueueStats(task.queue, previousStatus, status);
     }
 
-    logger.info({ taskId, status }, 'Task status updated');
+    if (task.traceId) {
+      withTrace({ trace_id: task.traceId, span_id: taskId, parent_span_id: task.parentSpanId })
+        .info({ taskId, status }, 'Task status updated');
+    } else {
+      logger.info({ taskId, status }, 'Task status updated');
+    }
   }
 
   /**
@@ -234,7 +271,12 @@ export class TaskQueue {
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
 
-    logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
+    if (task.traceId) {
+      withTrace({ trace_id: task.traceId, span_id: taskId, parent_span_id: task.parentSpanId })
+        .info({ taskId, attempt: task.retries }, 'Task retry queued');
+    } else {
+      logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
+    }
     return true;
   }
 
@@ -246,6 +288,22 @@ export class TaskQueue {
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
     const taskIds = await client.zRange(queueKey, offset, offset + limit - 1, { REV: true });
+    const tasks: Task[] = [];
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (task) tasks.push(task);
+    }
+
+    return tasks;
+  }
+
+  /**
+   * Get all tasks by trace ID
+   */
+  static async getTasksByTraceId(traceId: string): Promise<Task[]> {
+    const client = getRedisClient();
+    const taskIds = await client.sMembers(`trace:${traceId}`);
     const tasks: Task[] = [];
 
     for (const taskId of taskIds) {

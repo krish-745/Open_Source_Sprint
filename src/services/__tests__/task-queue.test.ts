@@ -10,6 +10,9 @@ jest.mock('../redis', () => {
     hIncrBy: jest.fn(),
     lPush: jest.fn(),
     del: jest.fn(),
+    sAdd: jest.fn(),
+    sMembers: jest.fn(),
+    expire: jest.fn(),
   };
   return { getRedisClient: jest.fn(() => mClient) };
 });
@@ -113,6 +116,77 @@ describe('TaskQueue', () => {
       
       expect(task).toBeDefined();
       expect(task.name).toBe('test-task');
+    });
+  });
+
+  describe('Distributed Tracing (Issue #39)', () => {
+    it('should generate a traceId when no traceId is provided and no dependencies', async () => {
+      redisClient.zCard.mockResolvedValue(0);
+      const task = await TaskQueue.createTask('test-task', 'handler', {});
+
+      expect(task.traceId).toBeDefined();
+      expect(typeof task.traceId).toBe('string');
+      // No dependencies → no parentSpanId
+      expect(task.parentSpanId).toBeUndefined();
+      expect(redisClient.sAdd).toHaveBeenCalledWith(`trace:${task.traceId}`, task.id);
+      // Trace index must be given a TTL so it doesn't accumulate forever
+      expect(redisClient.expire).toHaveBeenCalledWith(`trace:${task.traceId}`, expect.any(Number));
+    });
+
+    it('should inherit traceId and set parentSpanId from the dependency task', async () => {
+      const depTask = {
+        id: 'dep-task-id',
+        status: 'completed',
+        traceId: 'trace-1234',
+      };
+
+      redisClient.get.mockResolvedValue(JSON.stringify(depTask));
+      redisClient.zCard.mockResolvedValue(0);
+
+      const task = await TaskQueue.createTask('child-task', 'handler', {}, {
+        dependencies: ['dep-task-id'],
+      });
+
+      // traceId flows down from the dependency
+      expect(task.traceId).toBe('trace-1234');
+      // parentSpanId points at the direct dependency, enabling call-tree reconstruction
+      expect(task.parentSpanId).toBe('dep-task-id');
+      expect(redisClient.sAdd).toHaveBeenCalledWith('trace:trace-1234', task.id);
+      expect(redisClient.expire).toHaveBeenCalledWith('trace:trace-1234', expect.any(Number));
+    });
+
+    it('should use an explicitly provided traceId and parentSpanId over auto-derived values', async () => {
+      const depTask = { id: 'dep-id', status: 'completed', traceId: 'trace-auto' };
+      redisClient.get.mockResolvedValue(JSON.stringify(depTask));
+      redisClient.zCard.mockResolvedValue(0);
+
+      const task = await TaskQueue.createTask('override-task', 'handler', {}, {
+        dependencies: ['dep-id'],
+        traceId: 'trace-explicit',
+        parentSpanId: 'custom-parent-span',
+      });
+
+      expect(task.traceId).toBe('trace-explicit');
+      expect(task.parentSpanId).toBe('custom-parent-span');
+    });
+
+    it('should query all tasks in a trace by traceId', async () => {
+      redisClient.sMembers.mockResolvedValue(['task-1', 'task-2']);
+      redisClient.get.mockImplementation((key: string) => {
+        if (key === 'task:task-1') return Promise.resolve(JSON.stringify({ id: 'task-1', traceId: 'trace-999' }));
+        if (key === 'task:task-2') return Promise.resolve(JSON.stringify({ id: 'task-2', traceId: 'trace-999' }));
+        return Promise.resolve(null);
+      });
+
+      const tasks = await TaskQueue.getTasksByTraceId('trace-999');
+      expect(tasks).toHaveLength(2);
+      expect(tasks.map(t => t.id)).toEqual(['task-1', 'task-2']);
+    });
+
+    it('should return empty array when traceId has no registered tasks', async () => {
+      redisClient.sMembers.mockResolvedValue([]);
+      const tasks = await TaskQueue.getTasksByTraceId('trace-no-match');
+      expect(tasks).toHaveLength(0);
     });
   });
 });
