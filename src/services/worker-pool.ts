@@ -1,0 +1,258 @@
+import { v4 as uuidv4 } from 'uuid';
+import { getRedisClient } from './redis';
+import logger from '../utils/logger';
+import { Worker, WorkerStatus, Task, TaskExecutionMetrics } from '../types';
+
+const WORKER_PREFIX = 'worker:';
+const WORKERS_INDEX = 'workers:index';
+const WORKER_HANDLERS = 'worker:handlers:map';
+const METRICS_PREFIX = 'metrics:worker:';
+
+export class WorkerPool {
+  /**
+   * Register a new worker
+   */
+  static async registerWorker(
+    name: string,
+    handlers: string[],
+    options: {
+      maxConcurrent?: number;
+      version?: string;
+      tags?: string[];
+    } = {}
+  ): Promise<Worker> {
+    const client = getRedisClient();
+    const workerId = uuidv4();
+
+    const worker: Worker = {
+      id: workerId,
+      name,
+      status: 'online',
+      handlers,
+      maxConcurrent: options.maxConcurrent || 5,
+      currentTasks: 0,
+      totalProcessed: 0,
+      totalFailed: 0,
+      lastHeartbeat: new Date(),
+      registeredAt: new Date(),
+      version: options.version || '1.0.0',
+      capacity: 0,
+      tags: options.tags || [],
+    };
+
+    await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+    await client.zadd(WORKERS_INDEX, { score: Date.now(), member: workerId });
+
+    // Map handlers to worker
+    for (const handler of handlers) {
+      await client.sadd(`${WORKER_HANDLERS}:${handler}`, workerId);
+    }
+
+    logger.info({ workerId, name, handlers }, 'Worker registered');
+    return worker;
+  }
+
+  /**
+   * Get worker by ID
+   */
+  static async getWorker(workerId: string): Promise<Worker | null> {
+    const client = getRedisClient();
+    const data = await client.get(`${WORKER_PREFIX}${workerId}`);
+    return data ? JSON.parse(data) : null;
+  }
+
+  /**
+   * Update worker status
+   */
+  static async updateWorkerStatus(workerId: string, status: WorkerStatus): Promise<void> {
+    const client = getRedisClient();
+    const worker = await this.getWorker(workerId);
+
+    if (!worker) {
+      throw new Error(`Worker ${workerId} not found`);
+    }
+
+    worker.status = status;
+    worker.lastHeartbeat = new Date();
+    worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
+
+    await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+  }
+
+  /**
+   * Get available workers for a specific handler
+   */
+  static async getAvailableWorkers(handler: string): Promise<Worker[]> {
+    const client = getRedisClient();
+    const workerIds = await client.smembers(`${WORKER_HANDLERS}:${handler}`);
+
+    const availableWorkers: Worker[] = [];
+
+    for (const workerId of workerIds) {
+      const worker = await this.getWorker(workerId);
+      if (
+        worker &&
+        worker.status === 'online' &&
+        worker.currentTasks < worker.maxConcurrent
+      ) {
+        availableWorkers.push(worker);
+      }
+    }
+
+    // Sort by capacity (least busy first)
+    availableWorkers.sort((a, b) => a.capacity - b.capacity);
+    return availableWorkers;
+  }
+
+  /**
+   * Assign task to worker
+   */
+  static async assignTask(workerId: string, task: Task): Promise<void> {
+    const client = getRedisClient();
+    const worker = await this.getWorker(workerId);
+
+    if (!worker) {
+      throw new Error(`Worker ${workerId} not found`);
+    }
+
+    worker.currentTasks++;
+    worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
+
+    await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+    await client.lpush(`worker:${workerId}:tasks`, task.id);
+
+    logger.info({ workerId, taskId: task.id }, 'Task assigned to worker');
+  }
+
+  /**
+   * Complete task on worker
+   */
+  static async completeTask(
+    workerId: string,
+    taskId: string,
+    metrics: Partial<TaskExecutionMetrics>
+  ): Promise<void> {
+    const client = getRedisClient();
+    const worker = await this.getWorker(workerId);
+
+    if (!worker) {
+      throw new Error(`Worker ${workerId} not found`);
+    }
+
+    worker.currentTasks = Math.max(0, worker.currentTasks - 1);
+    worker.totalProcessed++;
+
+    if (!metrics.success) {
+      worker.totalFailed++;
+    }
+
+    worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
+
+    await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+    await client.lrem(`worker:${workerId}:tasks`, 1, taskId);
+
+    // Store metrics
+    const metricsKey = `${METRICS_PREFIX}${workerId}:${Date.now()}`;
+    await client.set(
+      metricsKey,
+      JSON.stringify({
+        workerId,
+        taskId,
+        ...metrics,
+      }),
+      { EX: 7 * 24 * 60 * 60 } // 7 days retention
+    );
+  }
+
+  /**
+   * Heartbeat to keep worker alive
+   */
+  static async heartbeat(workerId: string): Promise<boolean> {
+    const client = getRedisClient();
+    const worker = await this.getWorker(workerId);
+
+    if (!worker) {
+      return false;
+    }
+
+    worker.lastHeartbeat = new Date();
+    await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+    return true;
+  }
+
+  /**
+   * Check and mark stale workers as offline
+   */
+  static async checkStaleWorkers(timeoutSeconds: number = 60): Promise<number> {
+    const client = getRedisClient();
+    const allWorkers = await client.zrange(WORKERS_INDEX, 0, -1);
+
+    let staleCount = 0;
+    const now = Date.now();
+    const timeout = timeoutSeconds * 1000;
+
+    for (const workerId of allWorkers) {
+      const worker = await this.getWorker(workerId);
+      if (worker && now - worker.lastHeartbeat.getTime() > timeout) {
+        worker.status = 'offline';
+        await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+        staleCount++;
+        logger.warn({ workerId }, 'Worker marked as offline');
+      }
+    }
+
+    return staleCount;
+  }
+
+  /**
+   * Get worker metrics
+   */
+  static async getWorkerMetrics(workerId: string) {
+    const client = getRedisClient();
+    const worker = await this.getWorker(workerId);
+
+    if (!worker) {
+      throw new Error(`Worker ${workerId} not found`);
+    }
+
+    const successRate =
+      worker.totalProcessed > 0
+        ? ((worker.totalProcessed - worker.totalFailed) / worker.totalProcessed) * 100
+        : 0;
+
+    return {
+      workerId,
+      name: worker.name,
+      status: worker.status,
+      currentTasks: worker.currentTasks,
+      totalProcessed: worker.totalProcessed,
+      totalFailed: worker.totalFailed,
+      successRate: successRate.toFixed(2),
+      capacity: worker.capacity,
+      handlers: worker.handlers,
+      lastHeartbeat: worker.lastHeartbeat,
+    };
+  }
+
+  /**
+   * Unregister worker
+   */
+  static async unregisterWorker(workerId: string): Promise<void> {
+    const client = getRedisClient();
+    const worker = await this.getWorker(workerId);
+
+    if (!worker) {
+      throw new Error(`Worker ${workerId} not found`);
+    }
+
+    // Remove from handlers map
+    for (const handler of worker.handlers) {
+      await client.srem(`${WORKER_HANDLERS}:${handler}`, workerId);
+    }
+
+    await client.del(`${WORKER_PREFIX}${workerId}`);
+    await client.zrem(WORKERS_INDEX, workerId);
+
+    logger.info({ workerId }, 'Worker unregistered');
+  }
+}
