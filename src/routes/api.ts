@@ -78,6 +78,65 @@ router.get('/queues/:queueName/tasks', async (req: Request, res: Response) => {
   }
 });
 
+// Dead Letter Queue (DLQ) endpoints
+
+router.get('/dlq', async (req: Request, res: Response) => {
+  try {
+    const { startDate, endDate, errorType } = req.query;
+
+    const filters: any = {};
+    if (startDate) {
+      filters.startDate = new Date(startDate as string);
+    }
+    if (endDate) {
+      filters.endDate = new Date(endDate as string);
+    }
+    if (errorType) {
+      filters.errorType = errorType as string;
+    }
+
+    const tasks = await TaskQueue.getDLQTasks(filters);
+    const stats = await TaskQueue.getDLQStats();
+
+    res.json({ tasks, stats });
+  } catch (error: any) {
+    logger.error({ error }, 'Get DLQ tasks error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/dlq/:taskId/retry', async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const success = await TaskQueue.retryDLQTask(taskId);
+
+    if (!success) {
+      return res.status(404).json({ error: `Task ${taskId} not found in DLQ` });
+    }
+
+    res.json({ success: true, message: `Task ${taskId} successfully queued for retry` });
+  } catch (error: any) {
+    logger.error({ error }, 'Retry DLQ task error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.delete('/dlq/:taskId', async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const success = await TaskQueue.deleteDLQTask(taskId);
+
+    if (!success) {
+      return res.status(404).json({ error: `Task ${taskId} not found in DLQ` });
+    }
+
+    res.json({ success: true, message: `Task ${taskId} successfully removed from DLQ` });
+  } catch (error: any) {
+    logger.error({ error }, 'Delete DLQ task error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Worker endpoints
 
 router.post('/workers', async (req: Request, res: Response) => {

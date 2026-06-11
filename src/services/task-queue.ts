@@ -228,6 +228,169 @@ export class TaskQueue {
     return deleted;
   }
 
+  /**
+   * Get all tasks in the Dead Letter Queue, with optional filtering
+   */
+  static async getDLQTasks(
+    filters: {
+      startDate?: Date;
+      endDate?: Date;
+      errorType?: string;
+    } = {}
+  ): Promise<Task[]> {
+    const client = getRedisClient();
+    const rawTasks = await client.lRange(DEAD_LETTER_QUEUE, 0, -1);
+    const tasks: Task[] = [];
+
+    for (const raw of rawTasks) {
+      try {
+        const task: Task = JSON.parse(raw);
+
+        // Filter by date range (on completedAt/failed time)
+        if (filters.startDate && task.completedAt && new Date(task.completedAt) < new Date(filters.startDate)) {
+          continue;
+        }
+        if (filters.endDate && task.completedAt && new Date(task.completedAt) > new Date(filters.endDate)) {
+          continue;
+        }
+
+        // Filter by error type (substring search on error message)
+        if (filters.errorType && task.error && !task.error.toLowerCase().includes(filters.errorType.toLowerCase())) {
+          continue;
+        }
+
+        tasks.push(task);
+      } catch (err) {
+        // Ignore JSON parse error
+      }
+    }
+
+    return tasks;
+  }
+
+  /**
+   * Get Dead Letter Queue statistics
+   */
+  static async getDLQStats() {
+    const client = getRedisClient();
+    const size = await client.lLen(DEAD_LETTER_QUEUE);
+
+    const rawTasks = await client.lRange(DEAD_LETTER_QUEUE, 0, -1);
+    const errorTypeBreakdown: Record<string, number> = {};
+    const queueBreakdown: Record<string, number> = {};
+
+    for (const raw of rawTasks) {
+      try {
+        const task: Task = JSON.parse(raw);
+
+        // Queue breakdown
+        const qName = task.queue || 'default';
+        queueBreakdown[qName] = (queueBreakdown[qName] || 0) + 1;
+
+        // Error breakdown
+        if (task.error) {
+          const firstWord = task.error.split(' ')[0] || 'UnknownError';
+          errorTypeBreakdown[firstWord] = (errorTypeBreakdown[firstWord] || 0) + 1;
+        } else {
+          errorTypeBreakdown['Unknown'] = (errorTypeBreakdown['Unknown'] || 0) + 1;
+        }
+      } catch (err) {
+        // Ignore
+      }
+    }
+
+    return {
+      size,
+      queues: queueBreakdown,
+      errors: errorTypeBreakdown,
+    };
+  }
+
+  /**
+   * Retry a task from the DLQ by ID
+   */
+  static async retryDLQTask(taskId: string): Promise<boolean> {
+    const client = getRedisClient();
+    const rawTasks = await client.lRange(DEAD_LETTER_QUEUE, 0, -1);
+
+    let targetTask: Task | null = null;
+    let targetRaw: string | null = null;
+
+    for (const raw of rawTasks) {
+      try {
+        const task: Task = JSON.parse(raw);
+        if (task.id === taskId) {
+          targetTask = task;
+          targetRaw = raw;
+          break;
+        }
+      } catch (err) {
+        // Ignore
+      }
+    }
+
+    if (!targetTask || !targetRaw) {
+      return false;
+    }
+
+    // Remove from DLQ list
+    await client.lRem(DEAD_LETTER_QUEUE, 1, targetRaw);
+
+    // Re-initialize task details
+    targetTask.status = 'pending';
+    targetTask.retries = 0;
+    delete targetTask.error;
+    targetTask.createdAt = new Date();
+    delete targetTask.startedAt;
+    delete targetTask.completedAt;
+
+    // Save as active task key
+    await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(targetTask));
+    await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
+
+    // Place back in the queue
+    const queueKey = `${QUEUE_PREFIX}${targetTask.queue}`;
+    const score = this._calculateQueueScore(targetTask.priority);
+    await client.zAdd(queueKey, { score, value: taskId });
+
+    // Update queue stats
+    await this._updateQueueStats(targetTask.queue, 1);
+
+    logger.info({ taskId }, 'Task successfully retried from DLQ');
+    return true;
+  }
+
+  /**
+   * Delete a task from the DLQ by ID
+   */
+  static async deleteDLQTask(taskId: string): Promise<boolean> {
+    const client = getRedisClient();
+    const rawTasks = await client.lRange(DEAD_LETTER_QUEUE, 0, -1);
+
+    let targetRaw: string | null = null;
+
+    for (const raw of rawTasks) {
+      try {
+        const task: Task = JSON.parse(raw);
+        if (task.id === taskId) {
+          targetRaw = raw;
+          break;
+        }
+      } catch (err) {
+        // Ignore
+      }
+    }
+
+    if (!targetRaw) {
+      return false;
+    }
+
+    // Remove from DLQ list
+    const count = await client.lRem(DEAD_LETTER_QUEUE, 1, targetRaw);
+    logger.info({ taskId }, 'Task deleted from DLQ');
+    return count > 0;
+  }
+
   // Private helper methods
 
   private static _calculateQueueScore(priority: string): number {
