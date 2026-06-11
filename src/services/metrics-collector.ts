@@ -108,7 +108,13 @@ export class MetricsCollector {
   }
 
   /**
-   * Get latest snapshot
+   * Get latest snapshot.
+   *
+   * Snapshot keys are formatted as `snapshot:<epochMillis>`. They are compared
+   * by the numeric timestamp extracted from each key rather than sorted as
+   * strings, because lexicographic ordering breaks once timestamps differ in
+   * length (e.g. `snapshot:9999999999999` would sort after
+   * `snapshot:10000000000000`).
    */
   static async getLatestSnapshot(): Promise<SystemMetrics | null> {
     const client = getRedisClient();
@@ -116,12 +122,20 @@ export class MetricsCollector {
 
     if (keys.length === 0) return null;
 
-    // Get most recent snapshot
-    keys.sort();
-    const latestKey = keys[keys.length - 1];
+    // Pick the key with the largest numeric timestamp.
+    const latestKey = keys.reduce((latest, key) =>
+      this._extractSnapshotTimestamp(key) > this._extractSnapshotTimestamp(latest) ? key : latest
+    );
 
     const data = await client.get(latestKey);
     return data ? JSON.parse(data) : null;
+  }
+
+  /**
+   * Extract the epoch-millisecond timestamp from a snapshot key.
+   */
+  private static _extractSnapshotTimestamp(key: string): number {
+    return parseInt(key.slice(SNAPSHOT_PREFIX.length), 10) || 0;
   }
 
   /**

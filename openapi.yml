@@ -1,0 +1,453 @@
+openapi: 3.0.3
+info:
+  title: TaskFlow Distributed API
+  version: 1.0.0
+  description: >
+    Distributed task scheduling and execution framework with real-time
+    monitoring. All application endpoints are served under the `/api` prefix.
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+
+tags:
+  - name: Tasks
+  - name: Workers
+  - name: Metrics
+  - name: Admin
+  - name: System
+
+paths:
+  /healthz:
+    get:
+      tags: [System]
+      summary: Liveness probe
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/tasks:
+    post:
+      tags: [Tasks]
+      summary: Create a task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+            example:
+              name: nightly-report
+              handler: reportGenerator
+              payload: { format: pdf }
+              priority: high
+              maxRetries: 3
+              timeout: 30000
+              tags: [reports]
+      responses:
+        '201':
+          description: Task created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          description: Missing required fields or unknown handler
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/tasks/{taskId}:
+    get:
+      tags: [Tasks]
+      summary: Get a task by id
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+      responses:
+        '200':
+          description: The task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Task not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/queues/{queueName}/tasks:
+    get:
+      tags: [Tasks]
+      summary: List tasks in a queue with stats
+      parameters:
+        - name: queueName
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Tasks and queue statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+                  stats:
+                    $ref: '#/components/schemas/QueueStats'
+
+  /api/workers:
+    post:
+      tags: [Workers]
+      summary: Register a worker
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterWorkerRequest'
+            example:
+              name: worker-1
+              handlers: [reportGenerator, emailSender]
+              maxConcurrent: 5
+      responses:
+        '201':
+          description: Worker registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Worker'
+        '400':
+          description: Missing required fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/workers/{workerId}:
+    get:
+      tags: [Workers]
+      summary: Get a worker by id
+      parameters:
+        - $ref: '#/components/parameters/WorkerId'
+      responses:
+        '200':
+          description: The worker
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Worker'
+        '404':
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/workers/{workerId}/metrics:
+    get:
+      tags: [Workers]
+      summary: Get worker metrics
+      parameters:
+        - $ref: '#/components/parameters/WorkerId'
+      responses:
+        '200':
+          description: Worker metrics
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/workers/{workerId}/heartbeat:
+    post:
+      tags: [Workers]
+      summary: Send a worker heartbeat
+      parameters:
+        - $ref: '#/components/parameters/WorkerId'
+      responses:
+        '200':
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '404':
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/workers/{workerId}/unregister:
+    post:
+      tags: [Admin]
+      summary: Unregister a worker
+      parameters:
+        - $ref: '#/components/parameters/WorkerId'
+      responses:
+        '200':
+          description: Worker unregistered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+
+  /api/health:
+    get:
+      tags: [Metrics]
+      summary: Aggregated system health
+      responses:
+        '200':
+          description: Health status
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/metrics:
+    get:
+      tags: [Metrics]
+      summary: Latest metrics snapshot
+      responses:
+        '200':
+          description: Latest snapshot (or null if none captured yet)
+          content:
+            application/json:
+              schema:
+                type: object
+                nullable: true
+
+  /api/metrics/queues:
+    get:
+      tags: [Metrics]
+      summary: Detailed queue metrics
+      responses:
+        '200':
+          description: Queue metrics
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/metrics/workers:
+    get:
+      tags: [Metrics]
+      summary: Worker performance metrics
+      responses:
+        '200':
+          description: Worker performance list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+
+  /api/cleanup:
+    post:
+      tags: [Admin]
+      summary: Clean up old completed/failed tasks
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                hoursAgo:
+                  type: integer
+                  default: 24
+      responses:
+        '200':
+          description: Number of tasks deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+                  hoursAgo:
+                    type: integer
+
+components:
+  parameters:
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema:
+        type: string
+    WorkerId:
+      name: workerId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    CreateTaskRequest:
+      type: object
+      required: [name, handler]
+      properties:
+        name:
+          type: string
+        handler:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        queueName:
+          type: string
+          default: default
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+        maxRetries:
+          type: integer
+        timeout:
+          type: integer
+          description: Milliseconds
+        tags:
+          type: array
+          items:
+            type: string
+
+    RegisterWorkerRequest:
+      type: object
+      required: [name, handlers]
+      properties:
+        name:
+          type: string
+        handlers:
+          type: array
+          items:
+            type: string
+        maxConcurrent:
+          type: integer
+        version:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+
+    Task:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        priority:
+          type: string
+          enum: [low, medium, high, critical]
+        status:
+          type: string
+          enum: [pending, queued, processing, completed, failed, retry, cancelled, blocked]
+        handler:
+          type: string
+        payload:
+          type: object
+        retries:
+          type: integer
+        maxRetries:
+          type: integer
+        timeout:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        queue:
+          type: string
+        dependencies:
+          type: array
+          items:
+            type: string
+        tags:
+          type: array
+          items:
+            type: string
+
+    Worker:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+          enum: [online, offline, busy, idle, maintenance]
+        handlers:
+          type: array
+          items:
+            type: string
+        maxConcurrent:
+          type: integer
+        currentTasks:
+          type: integer
+        capacity:
+          type: integer
+
+    QueueStats:
+      type: object
+      properties:
+        queueName:
+          type: string
+        queueSize:
+          type: integer
+        pending:
+          type: integer
+        processing:
+          type: integer
+        completed:
+          type: integer
+        failed:
+          type: integer
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
