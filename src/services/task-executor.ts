@@ -146,7 +146,14 @@ export class TaskExecutor {
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
       this.clearCancellation(task.id);
-      await WorkerPool.updateWorkerStatus(workerId, 'idle');
+
+      // Reflect the worker's actual state: it is only idle once it has no
+      // remaining tasks. With concurrent execution, other tasks may still be
+      // running when this one finishes, so the worker should stay busy.
+      const worker = await WorkerPool.getWorker(workerId);
+      if (worker) {
+        await WorkerPool.updateWorkerStatus(workerId, worker.currentTasks > 0 ? 'busy' : 'idle');
+      }
     }
   }
 
