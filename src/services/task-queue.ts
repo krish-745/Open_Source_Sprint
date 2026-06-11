@@ -167,21 +167,82 @@ export class TaskQueue {
   }
 
   /**
-   * Get all tasks from queue
+   * Get tasks from queue, with optional filters
    */
-  static async getQueueTasks(queueName: string, limit: number = 100, offset: number = 0): Promise<Task[]> {
+  static async getQueueTasks(
+    queueName: string,
+    limit: number = 100,
+    offset: number = 0,
+    filters: {
+      status?: string | string[];
+      priority?: string | string[];
+      tags?: string | string[];
+      startDate?: Date;
+      endDate?: Date;
+    } = {}
+  ): Promise<Task[]> {
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
-    const taskIds = await client.zRange(queueKey, offset, offset + limit - 1, { REV: true });
-    const tasks: Task[] = [];
+    const hasFilters =
+      filters.status ||
+      filters.priority ||
+      filters.tags ||
+      filters.startDate ||
+      filters.endDate;
 
-    for (const taskId of taskIds) {
-      const task = await this.getTask(taskId);
-      if (task) tasks.push(task);
+    if (!hasFilters) {
+      const taskIds = await client.zRange(queueKey, offset, offset + limit - 1, { REV: true });
+      const tasks: Task[] = [];
+
+      for (const taskId of taskIds) {
+        const task = await this.getTask(taskId);
+        if (task) tasks.push(task);
+      }
+
+      return tasks;
     }
 
-    return tasks;
+    // Retrieve all tasks to filter them in memory
+    const allTaskIds = await client.zRange(queueKey, 0, -1, { REV: true });
+    const filteredTasks: Task[] = [];
+
+    for (const taskId of allTaskIds) {
+      const task = await this.getTask(taskId);
+      if (!task) continue;
+
+      // Filter by status (AND logic)
+      if (filters.status) {
+        const statuses = Array.isArray(filters.status) ? filters.status : [filters.status];
+        if (!statuses.includes(task.status)) continue;
+      }
+
+      // Filter by priority (AND logic)
+      if (filters.priority) {
+        const priorities = Array.isArray(filters.priority) ? filters.priority : [filters.priority];
+        if (!priorities.includes(task.priority)) continue;
+      }
+
+      // Filter by tags (AND logic: must match all specified tags)
+      if (filters.tags) {
+        const requiredTags = Array.isArray(filters.tags) ? filters.tags : [filters.tags];
+        const hasAllTags = requiredTags.every(tag => task.tags.includes(tag));
+        if (!hasAllTags) continue;
+      }
+
+      // Filter by date range (AND logic)
+      if (filters.startDate) {
+        if (new Date(task.createdAt) < new Date(filters.startDate)) continue;
+      }
+      if (filters.endDate) {
+        if (new Date(task.createdAt) > new Date(filters.endDate)) continue;
+      }
+
+      filteredTasks.push(task);
+    }
+
+    // Apply offset and limit
+    return filteredTasks.slice(offset, offset + limit);
   }
 
   /**
