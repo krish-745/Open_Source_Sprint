@@ -108,7 +108,8 @@ export class MetricsCollector {
   }
 
   /**
-   * Get latest snapshot
+   * Get latest snapshot.
+   * Extracts the timestamp from each snapshot key and sorts them numerically to find the most recent one.
    */
   static async getLatestSnapshot(): Promise<SystemMetrics | null> {
     const client = getRedisClient();
@@ -116,8 +117,13 @@ export class MetricsCollector {
 
     if (keys.length === 0) return null;
 
-    // Get most recent snapshot
-    keys.sort();
+    // Sort keys numerically by extracting the timestamp suffix to ensure correct ordering
+    keys.sort((a, b) => {
+      const tsA = Number(a.substring(SNAPSHOT_PREFIX.length));
+      const tsB = Number(b.substring(SNAPSHOT_PREFIX.length));
+      return tsA - tsB;
+    });
+
     const latestKey = keys[keys.length - 1];
 
     const data = await client.get(latestKey);
