@@ -1,13 +1,25 @@
 import { v4 as uuidv4 } from 'uuid';
+import { WatchError } from 'redis';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
-import { Task, TaskStatus, Queue, RecurrenceRule } from '../types';
+import { Task, TaskStatus, Queue, RecurrenceRule, TaskBranch } from '../types';
 
 const TASK_PREFIX = 'task:';
 const QUEUE_PREFIX = 'queue:';
 const QUEUE_LIST_KEY = 'queues:all';
 const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
+
+/**
+ * Thrown when a task's dependencies would introduce a circular dependency.
+ * Carries the offending cycle (as a list of task ids) for the caller to report.
+ */
+export class DependencyCycleError extends Error {
+  constructor(message: string, public readonly cycle: string[]) {
+    super(message);
+    this.name = 'DependencyCycleError';
+  }
+}
 
 /**
  * Thrown when a queue has reached its maximum capacity (backpressure).
@@ -22,12 +34,13 @@ export class QueueFullError extends Error {
 
 export class TaskQueue {
   /**
-   * Create a new task and add it to the queue
+   * Create a new task and add it to the queue.
+   * The payload must be a valid JSON object. If null or undefined is provided, it defaults to an empty object.
    */
   static async createTask(
     name: string,
     handler: string,
-    payload: Record<string, any>,
+    payload: Record<string, any> | null | undefined,
     options: {
       queueName?: string;
       priority?: 'low' | 'medium' | 'high' | 'critical';
@@ -44,6 +57,12 @@ export class TaskQueue {
     const taskId = uuidv4();
     const queueName = options.queueName || 'default';
 
+    if (payload !== undefined && payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) {
+      throw new Error('Payload must be a valid object');
+    }
+
+    const finalPayload = payload || {};
+
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
     const maxQueueSize = parseInt(process.env.MAX_QUEUE_SIZE || '10000', 10);
     const currentSize = await client.zCard(queueKey);
@@ -51,7 +70,6 @@ export class TaskQueue {
     if (currentSize >= maxQueueSize) {
       throw new QueueFullError(queueName, maxQueueSize);
     }
-
     const task: Task = {
       id: taskId,
       name,
@@ -59,7 +77,7 @@ export class TaskQueue {
       priority: options.priority || 'medium',
       status: 'pending',
       handler,
-      payload,
+      payload: finalPayload,
       retries: 0,
       maxRetries: options.maxRetries || 3,
       timeout: options.timeout || 30000,
@@ -71,6 +89,17 @@ export class TaskQueue {
       tags: options.tags || [],
       metadata: options.metadata || {},
     };
+
+    // Reject tasks that would introduce a circular dependency.
+    if (task.dependencies.length > 0) {
+      const cycle = await this._detectDependencyCycle(taskId, task.dependencies);
+      if (cycle) {
+        throw new DependencyCycleError(
+          `Circular dependency detected: ${cycle.join(' -> ')}`,
+          cycle
+        );
+      }
+    }
 
     // Store task
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
@@ -127,6 +156,31 @@ export class TaskQueue {
   }
 
   /**
+   * Evaluate a task's conditional branches against its result and return the
+   * branches that match, so the caller can enqueue the next step(s). A
+   * condition prefixed with `regex:` is matched as a regular expression against
+   * the stringified result; otherwise a substring match is used. Multiple
+   * branches may match.
+   */
+  static evaluateBranches(task: Task, result: any): TaskBranch[] {
+    if (!task.branches || task.branches.length === 0) {
+      return [];
+    }
+    const resultStr = typeof result === 'string' ? result : JSON.stringify(result ?? '');
+
+    return task.branches.filter((branch) => {
+      if (branch.condition.startsWith('regex:')) {
+        try {
+          return new RegExp(branch.condition.slice('regex:'.length)).test(resultStr);
+        } catch {
+          return false; // invalid regex never matches
+        }
+      }
+      return resultStr.includes(branch.condition);
+    });
+  }
+
+  /**
    * Get task by ID
    */
   static async getTask(taskId: string): Promise<Task | null> {
@@ -136,37 +190,62 @@ export class TaskQueue {
   }
 
   /**
-   * Update task status
+   * Update task status atomically.
+   *
+   * Concurrent workers can update the same task at once. To avoid lost updates
+   * from a non-atomic read-modify-write, this uses Redis optimistic locking
+   * (WATCH/MULTI/EXEC): the task key is watched, mutated, and committed in a
+   * transaction. If another client modifies the key first, the transaction is
+   * aborted (WatchError) and the operation is retried on a fresh read.
    */
   static async updateTaskStatus(taskId: string, status: TaskStatus, metadata?: Record<string, any>): Promise<void> {
     const client = getRedisClient();
-    const task = await this.getTask(taskId);
+    const key = `${TASK_PREFIX}${taskId}`;
+    const maxAttempts = 5;
 
-    if (!task) {
-      throw new Error(`Task ${taskId} not found`);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await client.watch(key);
+
+      const data = await client.get(key);
+      if (!data) {
+        await client.unwatch();
+        throw new Error(`Task ${taskId} not found`);
+      }
+
+      const task: Task = JSON.parse(data);
+      const previousStatus = task.status;
+
+      task.status = status;
+      if (metadata) {
+        Object.assign(task, metadata);
+      }
+      if (status === 'completed') {
+        task.completedAt = new Date();
+      } else if (status === 'processing') {
+        task.startedAt = new Date();
+      }
+
+      try {
+        await client.multi().set(key, JSON.stringify(task)).exec();
+
+        // Keep queue stats consistent as the task moves between states.
+        if (previousStatus !== status) {
+          await this._transitionQueueStats(task.queue, previousStatus, status);
+        }
+
+        logger.info({ taskId, status }, 'Task status updated');
+        return;
+      } catch (error) {
+        if (error instanceof WatchError) {
+          // The task changed under us; retry with the latest value.
+          logger.warn({ taskId, attempt }, 'Concurrent task update detected, retrying');
+          continue;
+        }
+        throw error;
+      }
     }
 
-    const previousStatus = task.status;
-
-    task.status = status;
-    if (metadata) {
-      Object.assign(task, metadata);
-    }
-
-    if (status === 'completed') {
-      task.completedAt = new Date();
-    } else if (status === 'processing') {
-      task.startedAt = new Date();
-    }
-
-    await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
-
-    // Keep queue stats consistent as the task moves between states.
-    if (previousStatus !== status) {
-      await this._transitionQueueStats(task.queue, previousStatus, status);
-    }
-
-    logger.info({ taskId, status }, 'Task status updated');
+    throw new Error(`Failed to update task ${taskId} after ${maxAttempts} attempts due to concurrent modifications`);
   }
 
   /**
@@ -209,6 +288,40 @@ export class TaskQueue {
   }
 
   /**
+   * Fetch up to `batchSize` runnable tasks from a queue in priority order, for
+   * workers that process tasks in batches. Applies the same runnability rules
+   * as getNextTask (dependencies met, not scheduled for later).
+   */
+  static async getNextBatch(queueName: string, batchSize: number = 10): Promise<Task[]> {
+    if (batchSize < 1) {
+      return [];
+    }
+    const client = getRedisClient();
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const taskIds = await client.zRange(queueKey, 0, -1, { REV: true });
+
+    const batch: Task[] = [];
+    for (const taskId of taskIds) {
+      if (batch.length >= batchSize) break;
+
+      const task = await this.getTask(taskId);
+      if (!task) continue;
+
+      if (task.dependencies.length > 0) {
+        const depsResolved = await this._checkDependencies(task.dependencies);
+        if (!depsResolved) continue;
+      }
+      if (task.scheduledFor && new Date(task.scheduledFor) > new Date()) {
+        continue;
+      }
+
+      batch.push(task);
+    }
+
+    return batch;
+  }
+
+  /**
    * Retry a failed task
    */
   static async retryTask(taskId: string): Promise<boolean> {
@@ -235,6 +348,31 @@ export class TaskQueue {
     await client.zAdd(queueKey, { score, value: taskId });
 
     logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
+    return true;
+  }
+
+  /**
+   * Cancel a task. Terminal tasks (completed/failed/already cancelled) cannot
+   * be cancelled and return false. Otherwise the task is marked `cancelled` and
+   * removed from its queue so it won't be dispatched. Returns true on success.
+   */
+  static async cancelTask(taskId: string): Promise<boolean> {
+    const client = getRedisClient();
+    const task = await this.getTask(taskId);
+
+    if (!task) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+
+    if (['completed', 'failed', 'cancelled'].includes(task.status)) {
+      return false;
+    }
+
+    task.status = 'cancelled';
+    await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+    await client.zRem(`${QUEUE_PREFIX}${task.queue}`, taskId);
+
+    logger.info({ taskId }, 'Task cancelled');
     return true;
   }
 
@@ -301,6 +439,30 @@ export class TaskQueue {
   }
 
   /**
+   * Put a task back on its queue for another worker to pick up, clearing any
+   * previous worker assignment. Used when a worker disconnects mid-execution.
+   * Returns false if the task no longer exists.
+   */
+  static async requeueTask(taskId: string): Promise<boolean> {
+    const client = getRedisClient();
+    const task = await this.getTask(taskId);
+    if (!task) {
+      return false;
+    }
+
+    task.status = 'queued';
+    task.workerId = undefined;
+    await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+    const queueKey = `${QUEUE_PREFIX}${task.queue}`;
+    const score = this._calculateQueueScore(task.priority);
+    await client.zAdd(queueKey, { score, value: taskId });
+
+    logger.info({ taskId }, 'Task requeued');
+    return true;
+  }
+
+  /**
    * Recover tasks orphaned by a crashed worker.
    *
    * A task whose worker dies stays in "processing" forever. This finds tasks
@@ -357,6 +519,51 @@ export class TaskQueue {
       low: 1,
     };
     return (priorityMap[priority] || 10) + Math.random();
+  }
+
+  /**
+   * Detect a circular dependency reachable from a new task using depth-first
+   * search. The new task (`rootId`) is treated as a graph node whose edges are
+   * its declared `rootDeps`; every other node's edges are read from the stored
+   * task's `dependencies`. Returns the cycle as an ordered list of task ids, or
+   * `null` if the dependency graph is acyclic. Transitive dependencies are
+   * followed, and missing/unknown dependencies are treated as leaf nodes.
+   */
+  private static async _detectDependencyCycle(
+    rootId: string,
+    rootDeps: string[]
+  ): Promise<string[] | null> {
+    const visited = new Set<string>();
+    const inStack = new Set<string>();
+    const path: string[] = [];
+
+    const dfs = async (node: string): Promise<string[] | null> => {
+      if (inStack.has(node)) {
+        const start = path.indexOf(node);
+        return [...path.slice(start), node];
+      }
+      if (visited.has(node)) {
+        return null;
+      }
+
+      visited.add(node);
+      inStack.add(node);
+      path.push(node);
+
+      const deps = node === rootId ? rootDeps : (await this.getTask(node))?.dependencies ?? [];
+      for (const dep of deps) {
+        const cycle = await dfs(dep);
+        if (cycle) {
+          return cycle;
+        }
+      }
+
+      inStack.delete(node);
+      path.pop();
+      return null;
+    };
+
+    return dfs(rootId);
   }
 
   private static async _checkDependencies(dependencyIds: string[]): Promise<boolean> {
