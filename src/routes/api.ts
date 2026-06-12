@@ -166,6 +166,21 @@ router.get('/tasks/:taskId', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/queues/:queueName/tasks
+ * Retrieve tasks from a specific queue with pagination and filtering support.
+ * 
+ * Query parameters:
+ * - limit: number of tasks to return (default: 100)
+ * - offset: number of tasks to skip (default: 0)
+ * - status: comma-separated list of statuses to filter by (e.g., pending,processing)
+ * - priority: comma-separated list of priorities to filter by (e.g., high,critical)
+ * - tags: comma-separated list of tags to filter by. Tasks must match ALL specified tags (AND logic).
+ * - startDate: ISO 8601 date string. Filter tasks created on or after this date.
+ * - endDate: ISO 8601 date string. Filter tasks created on or before this date.
+ * 
+ * Filters are combined using AND logic.
+ */
 router.patch('/tasks/:taskId', async (req: Request, res: Response) => {
   try {
     const { taskId } = req.params;
@@ -220,9 +235,31 @@ router.post('/tasks/:taskId/cancel', async (req: Request, res: Response) => {
 router.get('/queues/:queueName/tasks', async (req: Request, res: Response) => {
   try {
     const { queueName } = req.params;
-    const { limit = '100', offset = '0' } = req.query;
+    const { limit = '100', offset = '0', status, priority, tags, startDate, endDate } = req.query;
 
-    const tasks = await TaskQueue.getQueueTasks(queueName, parseInt(limit as string), parseInt(offset as string));
+    const filters: any = {};
+    if (status) {
+      filters.status = typeof status === 'string' ? status.split(',') : (status as string[]);
+    }
+    if (priority) {
+      filters.priority = typeof priority === 'string' ? priority.split(',') : (priority as string[]);
+    }
+    if (tags) {
+      filters.tags = typeof tags === 'string' ? tags.split(',') : (tags as string[]);
+    }
+    if (startDate) {
+      filters.startDate = new Date(startDate as string);
+    }
+    if (endDate) {
+      filters.endDate = new Date(endDate as string);
+    }
+
+    const tasks = await TaskQueue.getQueueTasks(
+      queueName,
+      parseInt(limit as string),
+      parseInt(offset as string),
+      filters
+    );
     const stats = await TaskQueue.getQueueStats(queueName);
 
     res.json({ tasks, stats });
