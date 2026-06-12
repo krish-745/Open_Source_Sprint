@@ -1,4 +1,5 @@
 import cron from 'node-cron';
+import { v4 as uuidv4 } from 'uuid';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
 import { TaskQueue } from './task-queue';
@@ -73,7 +74,7 @@ export class TaskScheduler {
   /**
    * Start the scheduler daemon
    */
-  static async startScheduler(pollIntervalMs: number = 5000): Promise<void> {
+  static async startScheduler(pollIntervalMs: number = 5000, lockTtlSeconds: number = 10): Promise<void> {
     if (this.schedulerRunning) {
       logger.warn('Scheduler already running');
       return;
@@ -91,45 +92,73 @@ export class TaskScheduler {
 
         // Acquire lock for distributed scheduling
         const lockKey = `${SCHEDULER_LOCK}`;
-        const lockId = `scheduler-${Date.now()}`;
+        const lockId = `scheduler-${uuidv4()}`;
 
         const acquired = await client.set(lockKey, lockId, {
           NX: true,
-          EX: 10,
+          EX: lockTtlSeconds,
         });
 
-        if (!acquired) {
-          // Another instance is processing
-          return;
-        }
+        if (acquired) {
+          // Start heartbeat to renew lock before it expires
+          const renewScript = `
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+              return redis.call("expire", KEYS[1], ARGV[2])
+            else
+              return 0
+            end
+          `;
+          
+          const heartbeatInterval = setInterval(async () => {
+            try {
+              await client.eval(renewScript, {
+                keys: [lockKey],
+                arguments: [lockId, lockTtlSeconds.toString()]
+              });
+            } catch (err) {
+              logger.error({ err }, 'Failed to renew scheduler lock');
+            }
+          }, (lockTtlSeconds * 1000) / 2);
 
-        // Get all tasks due to run
-        const dueTasks = await client.zRange(SCHEDULED_TASKS_KEY, 0, now, { BY: 'SCORE' });
-
-        for (const taskData of dueTasks) {
           try {
-            const { taskId } = JSON.parse(taskData);
-            const task = await TaskQueue.getTask(taskId);
+            // Get all tasks due to run
+            const dueTasks = await client.zRange(SCHEDULED_TASKS_KEY, 0, now, { BY: 'SCORE' });
 
-            if (task) {
-              // Move to queue for processing
-              await TaskQueue.updateTaskStatus(taskId, 'queued');
-              logger.info({ taskId }, 'Scheduled task moved to queue');
+            for (const taskData of dueTasks) {
+              try {
+                const { taskId } = JSON.parse(taskData);
+                const task = await TaskQueue.getTask(taskId);
+
+                if (task) {
+                  // Move to queue for processing
+                  await TaskQueue.updateTaskStatus(taskId, 'queued');
+                  logger.info({ taskId }, 'Scheduled task moved to queue');
+                }
+
+                await client.zRem(SCHEDULED_TASKS_KEY, taskData);
+              } catch (error) {
+                logger.error({ error, taskData }, 'Failed to process scheduled task');
+              }
             }
 
-            await client.zRem(SCHEDULED_TASKS_KEY, taskData);
-          } catch (error) {
-            logger.error({ error, taskData }, 'Failed to process scheduled task');
+            // Recover tasks orphaned by crashed workers while holding the lock.
+            await TaskQueue.recoverStaleTasks();
+          } finally {
+            clearInterval(heartbeatInterval);
+
+            // Release lock atomically
+            const releaseScript = `
+              if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+              else
+                return 0
+              end
+            `;
+            await client.eval(releaseScript, {
+              keys: [lockKey],
+              arguments: [lockId]
+            });
           }
-        }
-
-        // Recover tasks orphaned by crashed workers while holding the lock.
-        await TaskQueue.recoverStaleTasks();
-
-        // Release lock
-        const currentLock = await client.get(lockKey);
-        if (currentLock === lockId) {
-          await client.del(lockKey);
         }
       } catch (error) {
         logger.error({ error }, 'Scheduler error');
