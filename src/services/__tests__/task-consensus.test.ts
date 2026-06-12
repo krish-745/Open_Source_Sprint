@@ -83,6 +83,22 @@ function makeFakeRedis() {
       _hash(k).set(field, next.toString());
       return next;
     }),
+    watch: jest.fn(async () => 'OK'),
+    unwatch: jest.fn(async () => 'OK'),
+    multi: jest.fn(() => {
+      const operations: any[] = [];
+      const m = {
+        set: (k: string, v: string) => {
+          operations.push(() => { strings.set(k, v); });
+          return m;
+        },
+        exec: async () => {
+          for (const op of operations) op();
+          return ['OK'];
+        }
+      };
+      return m;
+    }),
     __strings: strings,
   } as any;
 }
