@@ -13,6 +13,7 @@ export interface SystemMetrics {
   workers: Record<string, any>;
   tasks: Record<string, any>;
   system: Record<string, any>;
+  totalCostIncurred?: number;
 }
 
 export interface SlaEvaluation {
@@ -167,6 +168,7 @@ export class MetricsCollector {
         memoryUsage: process.memoryUsage(),
         uptime: process.uptime(),
       },
+      totalCostIncurred: 0,
     };
 
     // Collect queue metrics
@@ -178,15 +180,18 @@ export class MetricsCollector {
     }
 
     // Collect worker metrics
+    let totalCost = 0;
     const workerIds = await client.zRange('workers:index', 0, -1);
     for (const workerId of workerIds) {
       try {
         const workerMetrics = await WorkerPool.getWorkerMetrics(workerId);
         metrics.workers[workerId] = workerMetrics;
+        totalCost += workerMetrics.totalCostIncurred || 0;
       } catch (error) {
         // Worker may not exist
       }
     }
+    metrics.totalCostIncurred = totalCost;
 
     // Collect task stats
     const taskIndexSize = await client.zCard('tasks:index');

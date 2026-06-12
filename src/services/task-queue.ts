@@ -50,8 +50,11 @@ export class TaskQueue {
       timeout?: number;
       dependencies?: string[];
       scheduledFor?: Date;
+      deadline?: Date;
       callbackUrl?: string;
       recurrence?: RecurrenceRule;
+      costEstimate?: { cpu?: number; memory?: number; money?: number };
+      budget?: number;
       tags?: string[];
       metadata?: Record<string, any>;
     } = {}
@@ -90,8 +93,11 @@ export class TaskQueue {
       queue: queueName,
       dependencies: options.dependencies || [],
       scheduledFor: options.scheduledFor,
+      deadline: options.deadline,
       callbackUrl: options.callbackUrl,
       recurrence: options.recurrence,
+      costEstimate: options.costEstimate,
+      budget: options.budget,
       tags: options.tags || [],
       metadata: options.metadata || {},
     };
@@ -209,6 +215,8 @@ export class TaskQueue {
       maxRetries?: number;
       tags?: string[];
       scheduledFor?: Date;
+      deadline?: Date;
+      budget?: number;
     }
   ): Promise<Task> {
     const client = getRedisClient();
@@ -243,6 +251,8 @@ export class TaskQueue {
     apply('maxRetries', fields.maxRetries);
     apply('tags', fields.tags);
     apply('scheduledFor', fields.scheduledFor);
+    apply('deadline', fields.deadline);
+    apply('budget', fields.budget);
 
     if (Object.keys(changes).length > 0) {
       const audit = (task.metadata.auditLog as any[]) || [];
@@ -532,6 +542,7 @@ export class TaskQueue {
 
     const queueSize = await client.zCard(queueKey);
     const stats = await client.hGetAll(statsKey);
+    const estimatedRemainingCost = await this.estimateQueueCost(queueName);
 
     return {
       queueName,
@@ -540,7 +551,26 @@ export class TaskQueue {
       processing: parseInt(stats.processing || '0'),
       completed: parseInt(stats.completed || '0'),
       failed: parseInt(stats.failed || '0'),
+      estimatedRemainingCost
     };
+  }
+
+  /**
+   * Estimate the remaining cost of pending and queued tasks in the queue.
+   */
+  static async estimateQueueCost(queueName: string): Promise<number> {
+    const client = getRedisClient();
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const taskIds = await client.zRange(queueKey, 0, -1);
+    
+    let totalCost = 0;
+    const tasks = await this._fetchTasksByIds(taskIds);
+    for (const task of tasks) {
+      if (task.status === 'pending' || task.status === 'queued') {
+        totalCost += task.costEstimate?.money ?? task.budget ?? 1;
+      }
+    }
+    return totalCost;
   }
 
   /**

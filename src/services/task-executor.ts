@@ -105,12 +105,16 @@ export class TaskExecutor {
       });
 
       const duration = Date.now() - startTime;
+      const workerForCost = await WorkerPool.getWorker(workerId);
+      const costIncurred = workerForCost ? WorkerPool.calculateTaskCost(workerForCost, task) : 0;
+
       await WorkerPool.completeTask(workerId, task.id, {
         duration,
         success: true,
         retriesUsed: task.retries,
         memory: 0,
         cpu: 0,
+        costIncurred,
       });
 
       await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result });
@@ -135,6 +139,9 @@ export class TaskExecutor {
         error: errorMessage,
       });
 
+      const workerForCost = await WorkerPool.getWorker(workerId);
+      const costIncurred = workerForCost ? WorkerPool.calculateTaskCost(workerForCost, task) : 0;
+
       if (retried) {
         await WorkerPool.completeTask(workerId, task.id, {
           duration,
@@ -142,6 +149,7 @@ export class TaskExecutor {
           retriesUsed: task.retries,
           memory: 0,
           cpu: 0,
+          costIncurred,
         });
       } else {
         // Move to dead letter queue
@@ -156,6 +164,7 @@ export class TaskExecutor {
           retriesUsed: task.retries,
           memory: 0,
           cpu: 0,
+          costIncurred,
         });
       }
     } finally {

@@ -22,8 +22,15 @@ export interface Task {
   queue: string;
   dependencies: string[]; // Task IDs this task depends on
   scheduledFor?: Date; // For delayed tasks
+  deadline?: Date; // For SLA/Cost deadlines
   callbackUrl?: string; // Optional webhook to POST the result to on completion
   branches?: TaskBranch[]; // Conditional next-steps evaluated against the result
+  costEstimate?: {
+    cpu?: number;
+    memory?: number;
+    money?: number;
+  };
+  budget?: number; // max cost allowed for this task
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
@@ -70,6 +77,12 @@ export interface Worker {
   registeredAt: Date;
   version: string;
   capacity: number; // 0-100 percentage
+  baseCostPerTask?: number; // monetary cost to use this worker per task
+  resourceRatings?: {
+    cpu?: number;
+    memory?: number;
+  };
+  totalCostIncurred?: number;
   tags: string[];
 }
 
@@ -108,6 +121,7 @@ export interface TaskExecutionMetrics {
   cpu: number;
   success: boolean;
   retriesUsed: number;
+  costIncurred?: number;
 }
 
 export interface WorkerMetrics {
@@ -115,6 +129,7 @@ export interface WorkerMetrics {
   tasksProcessed: number;
   successRate: number;
   avgDuration: number;
+  totalCostIncurred?: number;
   lastUpdated: Date;
 }
 
@@ -126,4 +141,5 @@ export interface QueueMetrics {
   failedTasks: number;
   avgWaitTime: number;
   avgProcessTime: number;
+  estimatedRemainingCost?: number;
 }

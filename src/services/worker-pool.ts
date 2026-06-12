@@ -39,6 +39,8 @@ export class WorkerPool {
       maxConcurrent?: number;
       version?: string;
       tags?: string[];
+      baseCostPerTask?: number;
+      resourceRatings?: { cpu?: number; memory?: number };
     } = {}
   ): Promise<Worker> {
     const client = getRedisClient();
@@ -57,6 +59,9 @@ export class WorkerPool {
       registeredAt: new Date(),
       version: options.version || '1.0.0',
       capacity: 0,
+      baseCostPerTask: options.baseCostPerTask,
+      resourceRatings: options.resourceRatings,
+      totalCostIncurred: 0,
       tags: options.tags || [],
     };
 
@@ -100,9 +105,11 @@ export class WorkerPool {
   }
 
   /**
-   * Get available workers for a specific handler
+   * Get available workers for a specific handler.
+   * If a task is provided, filters workers that exceed the task's budget,
+   * and sorts the remaining workers to minimize cost (then by capacity).
    */
-  static async getAvailableWorkers(handler: string): Promise<Worker[]> {
+  static async getAvailableWorkers(handler: string, task?: Task): Promise<Worker[]> {
     const client = getRedisClient();
     const workerIds = await client.sMembers(`${WORKER_HANDLERS}:${handler}`);
 
@@ -115,13 +122,44 @@ export class WorkerPool {
         worker.status === 'online' &&
         worker.currentTasks < worker.maxConcurrent
       ) {
+        if (task) {
+          const cost = this.calculateTaskCost(worker, task);
+          if (task.budget !== undefined && cost > task.budget) {
+            continue; // Exceeds budget, skip this worker
+          }
+        }
         availableWorkers.push(worker);
       }
     }
 
-    // Sort by capacity (least busy first)
-    availableWorkers.sort((a, b) => a.capacity - b.capacity);
+    if (task) {
+      // Sort by cost, then by capacity
+      availableWorkers.sort((a, b) => {
+        const costA = this.calculateTaskCost(a, task);
+        const costB = this.calculateTaskCost(b, task);
+        if (costA !== costB) {
+          return costA - costB;
+        }
+        return a.capacity - b.capacity;
+      });
+    } else {
+      // Sort purely by capacity (least busy first)
+      availableWorkers.sort((a, b) => a.capacity - b.capacity);
+    }
+    
     return availableWorkers;
+  }
+
+  /**
+   * Calculate the estimated monetary cost to run a task on a specific worker.
+   */
+  static calculateTaskCost(worker: Worker, task: Task): number {
+    let cost = worker.baseCostPerTask || 0;
+    if (worker.resourceRatings && task.costEstimate) {
+      cost += (worker.resourceRatings.cpu || 0) * (task.costEstimate.cpu || 0);
+      cost += (worker.resourceRatings.memory || 0) * (task.costEstimate.memory || 0);
+    }
+    return cost;
   }
 
   /**
@@ -161,6 +199,9 @@ export class WorkerPool {
 
     worker.currentTasks = Math.max(0, worker.currentTasks - 1);
     worker.totalProcessed++;
+
+    const taskCost = metrics.costIncurred || 0;
+    worker.totalCostIncurred = (worker.totalCostIncurred || 0) + taskCost;
 
     if (!metrics.success) {
       worker.totalFailed++;
@@ -280,6 +321,7 @@ export class WorkerPool {
       totalFailed: worker.totalFailed,
       successRate: successRate.toFixed(2),
       capacity: worker.capacity,
+      totalCostIncurred: worker.totalCostIncurred || 0,
       handlers: worker.handlers,
       lastHeartbeat: worker.lastHeartbeat,
     };
