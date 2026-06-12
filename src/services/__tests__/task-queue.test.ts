@@ -159,8 +159,7 @@ describe('TaskQueue Tests', () => {
       const results = await TaskQueue.searchTasks('Report', 1);
       expect(results.length).toBe(1);
     });
-
-
+  });
 
   describe('getQueueTasks with filtering', () => {
     const queueName = 'test-queue';
