@@ -307,50 +307,55 @@ export class TaskQueue {
     const maxAttempts = 5;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await client.watch(key);
-
-      const data = await client.get(key);
-      if (!data) {
-        await client.unwatch();
-        throw new Error(`Task ${taskId} not found`);
-      }
-
-      const task: Task = JSON.parse(data);
-      const previousStatus = task.status;
-
-      task.status = status;
-      if (metadata) {
-        Object.assign(task, metadata);
-      }
-      if (status === 'completed') {
-        task.completedAt = new Date();
-      } else if (status === 'processing') {
-        task.startedAt = new Date();
-      }
-
       try {
-        const timestamp = new Date(task.createdAt).getTime();
-        const multi = client.multi().set(key, JSON.stringify(task));
+        await client.executeIsolated(async (isolatedClient) => {
+          await isolatedClient.watch(key);
 
-        // Incorporate index updates directly into the optimistic locking transaction
-        if (previousStatus !== status) {
-          multi.zRem(`${TASK_STATUS_INDEX_PREFIX}${previousStatus}`, taskId);
-          multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${previousStatus}`, taskId);
-          multi.zAdd(`${TASK_STATUS_INDEX_PREFIX}${status}`, { score: timestamp, value: taskId });
-          multi.zAdd(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${status}`, { score: timestamp, value: taskId });
-        }
+          const data = await isolatedClient.get(key);
+          if (!data) {
+            await isolatedClient.unwatch();
+            throw new Error(`Task ${taskId} not found`);
+          }
 
-        await multi.exec();
+          const task: Task = JSON.parse(data);
+          const previousStatus = task.status;
 
-        // Keep queue stats consistent as the task moves between states.
-        if (previousStatus !== status) {
-          await this._transitionQueueStats(task.queue, previousStatus, status);
-        }
+          task.status = status;
+          if (metadata) {
+            Object.assign(task, metadata);
+          }
+          if (status === 'completed') {
+            task.completedAt = new Date();
+          } else if (status === 'processing') {
+            task.startedAt = new Date();
+          }
+
+          const timestamp = new Date(task.createdAt).getTime();
+          const multi = isolatedClient.multi().set(key, JSON.stringify(task));
+
+          // Incorporate index updates directly into the optimistic locking transaction
+          if (previousStatus !== status) {
+            multi.zRem(`${TASK_STATUS_INDEX_PREFIX}${previousStatus}`, taskId);
+            multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${previousStatus}`, taskId);
+            multi.zAdd(`${TASK_STATUS_INDEX_PREFIX}${status}`, { score: timestamp, value: taskId });
+            multi.zAdd(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${status}`, { score: timestamp, value: taskId });
+          }
+
+          const replies = await multi.exec();
+          if (replies === null) {
+            throw new WatchError();
+          }
+
+          // Keep queue stats consistent as the task moves between states.
+          if (previousStatus !== status) {
+            await this._transitionQueueStats(task.queue, previousStatus, status);
+          }
+        });
 
         logger.info({ taskId, status }, 'Task status updated');
         return;
       } catch (error) {
-        if (error instanceof WatchError) {
+        if (error instanceof WatchError || (error as Error).message.includes('watched keys has been changed')) {
           logger.warn({ taskId, attempt }, 'Concurrent task update detected, retrying');
           continue;
         }

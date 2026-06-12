@@ -86,6 +86,7 @@ function makeFakeRedis() {
     }),
     watch: jest.fn(async () => 'OK'),
     unwatch: jest.fn(async () => 'OK'),
+    executeIsolated: jest.fn(async function(this: any, cb: any) { return cb(this); }),
     multi: jest.fn(() => {
       const operations: any[] = [];
       const m = {

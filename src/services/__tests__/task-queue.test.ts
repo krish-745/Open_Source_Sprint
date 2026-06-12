@@ -6,9 +6,12 @@ const store: Record<string, string> = {};
 const queueStore: Record<string, string[]> = {};
 let taskIdsIndex: string[] = [];
 
-const mockRedisClient = {
+const mockRedisClient: any = {
   watch: jest.fn().mockResolvedValue('OK'),
   unwatch: jest.fn().mockResolvedValue('OK'),
+  executeIsolated: jest.fn().mockImplementation(async (callback: any) => {
+    return callback(mockRedisClient);
+  }),
   multi: jest.fn().mockImplementation(() => {
     const m: any = {
       set: jest.fn().mockImplementation((key: string, value: string) => {
@@ -287,6 +290,9 @@ describe('TaskQueue Tests', () => {
       });
       expect(result.length).toBe(1);
       expect(result[0].id).toBe('1');
+    });
+  });
+
   describe('createTask payload validation', () => {
     it('should create a task with a valid object payload', async () => {
       const payload = { key: 'value' };
