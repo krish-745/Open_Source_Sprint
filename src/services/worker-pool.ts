@@ -3,7 +3,6 @@ import { getRedisClient } from './redis';
 import logger from '../utils/logger';
 import { TaskQueue } from './task-queue';
 import { Worker, WorkerStatus, Task, TaskExecutionMetrics } from '../types';
-import { TaskQueue } from './task-queue';
 
 const WORKER_PREFIX = 'worker:';
 const WORKERS_INDEX = 'workers:index';

@@ -760,6 +760,9 @@ export class TaskQueue {
 
     // Limit results to prevent performance issues
     return results.slice(0, limit);
+  }
+
+  /**
    * Put a task back on its queue for another worker to pick up.
    */
   static async requeueTask(taskId: string): Promise<boolean> {
@@ -941,7 +944,6 @@ export class TaskQueue {
     multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${queueName}:status:${status}`, taskId);
     await multi.exec();
   }
->>>>>>> main
 
   private static _calculateQueueScore(priority: string): number {
     const priorityMap: Record<string, number> = {

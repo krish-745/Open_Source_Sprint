@@ -7,6 +7,20 @@ const queueStore: Record<string, string[]> = {};
 let taskIdsIndex: string[] = [];
 
 const mockRedisClient = {
+  watch: jest.fn().mockResolvedValue('OK'),
+  unwatch: jest.fn().mockResolvedValue('OK'),
+  multi: jest.fn().mockImplementation(() => {
+    const m: any = {
+      set: jest.fn().mockImplementation((key: string, value: string) => {
+        store[key] = value;
+        return m;
+      }),
+      zAdd: jest.fn().mockReturnThis(),
+      zRem: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue([['OK']]),
+    };
+    return m;
+  }),
   get: jest.fn().mockImplementation(async (key: string) => store[key] || null),
   set: jest.fn().mockImplementation(async (key: string, value: string) => {
     store[key] = value;
@@ -37,11 +51,20 @@ const mockRedisClient = {
   hIncrBy: jest.fn().mockResolvedValue(1),
   hSet: jest.fn().mockResolvedValue(1),
   hGet: jest.fn().mockResolvedValue(null),
+  hDel: jest.fn().mockResolvedValue(1),
+  mGet: jest.fn().mockImplementation(async (keys: string[]) => keys.map((k: string) => store[k] || null)),
   lPush: jest.fn().mockResolvedValue(1),
   del: jest.fn().mockImplementation(async (key: string) => {
     delete store[key];
     return 1;
   }),
+  zRem: jest.fn().mockImplementation(async (key: string, value: string) => {
+    if (queueStore[key]) {
+      queueStore[key] = queueStore[key].filter(v => v !== value);
+    }
+    return 1;
+  }),
+  hGetAll: jest.fn().mockResolvedValue({}),
 };
 
 jest.mock('../redis', () => ({
@@ -137,75 +160,7 @@ describe('TaskQueue Tests', () => {
       expect(results.length).toBe(1);
     });
 
-const store: Record<string, string> = {};
-const queueStore: Record<string, string[]> = {};
 
-const mockRedisClient = {
-  watch: jest.fn().mockResolvedValue('OK'),
-  unwatch: jest.fn().mockResolvedValue('OK'),
-  multi: jest.fn().mockImplementation(() => {
-    const m: any = {
-      set: jest.fn().mockImplementation((key: string, value: string) => {
-        store[key] = value;
-        return m;
-      }),
-      zAdd: jest.fn().mockReturnThis(),
-      zRem: jest.fn().mockReturnThis(),
-      exec: jest.fn().mockResolvedValue([['OK']]),
-    };
-    return m;
-  }),
-  get: jest.fn().mockImplementation(async (key: string) => store[key] || null),
-  set: jest.fn().mockImplementation(async (key: string, value: string) => {
-    store[key] = value;
-    return 'OK';
-  }),
-  zAdd: jest.fn().mockImplementation(async (key: string, item: { score: number; value: string }) => {
-    if (!queueStore[key]) {
-      queueStore[key] = [];
-    }
-    queueStore[key] = queueStore[key].filter(v => v !== item.value);
-    queueStore[key].push(item.value);
-    return 1;
-  }),
-  zCard: jest.fn().mockImplementation(async (key: string) => {
-    return (queueStore[key] || []).length;
-  }),
-  zRange: jest.fn().mockImplementation(async (key: string, start: number, stop: number, options?: any) => {
-    const list = queueStore[key] || [];
-    if (start === 0 && stop === -1) {
-      return list;
-    }
-    const end = stop < 0 ? list.length : stop + 1;
-    return list.slice(start, end);
-  }),
-  hIncrBy: jest.fn().mockResolvedValue(1),
-  hDel: jest.fn().mockResolvedValue(1),
-  mGet: jest.fn().mockImplementation(async (keys: string[]) => keys.map((k: string) => store[k] || null)),
-  lPush: jest.fn().mockResolvedValue(1),
-  del: jest.fn().mockImplementation(async (key: string) => {
-    delete store[key];
-    return 1;
-  }),
-  zRem: jest.fn().mockImplementation(async (key: string, value: string) => {
-    if (queueStore[key]) {
-      queueStore[key] = queueStore[key].filter(v => v !== value);
-    }
-    return 1;
-  }),
-  hGetAll: jest.fn().mockResolvedValue({}),
-};
-
-jest.mock('../redis', () => ({
-  getRedisClient: () => mockRedisClient,
-}));
-
-describe('TaskQueue Tests', () => {
-  beforeEach(() => {
-    for (const key in store) delete store[key];
-    for (const key in queueStore) delete queueStore[key];
-    jest.clearAllMocks();
-  });
 
   describe('getQueueTasks with filtering', () => {
     const queueName = 'test-queue';
@@ -748,10 +703,6 @@ describe('TaskQueue Tests', () => {
       store['task:t1'] = JSON.stringify({ id: 't1', status: 'pending', queue: 'default' });
       queueStore['queue:default'] = ['t1'];
       
-      expect(task).toBeDefined();
-      expect(task.name).toBe('test-task');
-
-      zCardSpy.mockRestore();
       const result = await TaskQueue.cancelTask('t1');
       expect(result).toBe(true);
       
