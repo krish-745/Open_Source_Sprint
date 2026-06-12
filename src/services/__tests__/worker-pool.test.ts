@@ -16,6 +16,12 @@ function makeFakeRedis() {
   const sets = new Map<string, Set<string>>();
   const zsets = new Map<string, Map<string, number>>();
   const lists = new Map<string, string[]>();
+  const hashes = new Map<string, Map<string, string>>();
+
+  const _hash = (k: string) => {
+    if (!hashes.has(k)) hashes.set(k, new Map());
+    return hashes.get(k)!;
+  };
 
   return {
     set: jest.fn(async (k: string, v: string) => {
@@ -66,6 +72,22 @@ function makeFakeRedis() {
       const i = l.indexOf(v);
       if (i >= 0) l.splice(i, 1);
       return 1;
+    }),
+    hSet: jest.fn(async (k: string, field: string, val: string) => {
+      _hash(k).set(field, val);
+      return 1;
+    }),
+    hGet: jest.fn(async (k: string, field: string) => _hash(k).get(field) ?? null),
+    hGetAll: jest.fn(async (k: string) => Object.fromEntries(_hash(k))),
+    hIncrBy: jest.fn(async (k: string, field: string, incr: number) => {
+      const curr = parseInt(_hash(k).get(field) ?? '0', 10);
+      const next = curr + incr;
+      _hash(k).set(field, next.toString());
+      return next;
+    }),
+    lRange: jest.fn(async (k: string, start: number, stop: number) => {
+      const l = lists.get(k) ?? [];
+      return stop === -1 ? l.slice(start) : l.slice(start, stop + 1);
     }),
     __strings: strings,
   } as any;
