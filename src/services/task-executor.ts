@@ -3,13 +3,37 @@ import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
 import { getRedisClient } from './redis';
+import { TaskHooks } from './task-hooks';
+
+export interface TaskExecutionContext {
+  /** Handlers can poll this to cooperatively stop work when cancelled. */
+  isCancelled: () => boolean;
+}
 
 export interface TaskHandler {
-  (payload: Record<string, any>): Promise<any>;
+  (payload: Record<string, any>, context?: TaskExecutionContext): Promise<any>;
 }
 
 export class TaskExecutor {
   private static handlers: Map<string, TaskHandler> = new Map();
+  private static cancelledTasks: Set<string> = new Set();
+
+  /**
+   * Request cancellation of a task. Removes it from the queue side via
+   * TaskQueue.cancelTask; here we record the signal so a running handler can
+   * observe it and the executor skips it if not yet started.
+   */
+  static cancel(taskId: string): void {
+    this.cancelledTasks.add(taskId);
+  }
+
+  static isCancelled(taskId: string): boolean {
+    return this.cancelledTasks.has(taskId);
+  }
+
+  static clearCancellation(taskId: string): void {
+    this.cancelledTasks.delete(taskId);
+  }
 
   /**
    * Register a task handler
@@ -27,6 +51,13 @@ export class TaskExecutor {
     let timeoutHandle: NodeJS.Timeout | undefined;
 
     try {
+      // Skip tasks cancelled before they start.
+      if (this.isCancelled(task.id)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled');
+        logger.info({ taskId: task.id }, 'Task cancelled before execution');
+        return;
+      }
+
       // If task is already completed/failed, skip processing to avoid straggler workers overriding state.
       const currentTask = await TaskQueue.getTask(task.id);
       if (currentTask && (currentTask.status === 'completed' || currentTask.status === 'failed')) {
@@ -60,14 +91,18 @@ export class TaskExecutor {
       });
 
       await WorkerPool.updateWorkerStatus(workerId, 'busy');
+      await TaskHooks.emitTask('task.started', task);
 
       let executionResult: any;
       let executionError: Error | undefined;
 
       try {
-        // Execute with timeout
+        // Execute with timeout, passing a cancellation-aware context.
+        const context: TaskExecutionContext = {
+          isCancelled: () => this.isCancelled(task.id),
+        };
         executionResult = await Promise.race([
-          handler(task.payload),
+          handler(task.payload, context),
           new Promise<never>((_, reject) => {
             timeoutHandle = setTimeout(() => {
               reject(new Error(`Task execution timeout after ${task.timeout}ms`));
@@ -78,6 +113,21 @@ export class TaskExecutor {
         executionError = err;
       } finally {
         if (timeoutHandle) clearTimeout(timeoutHandle);
+      }
+
+      // If the task was cancelled mid-flight, record it rather than completing.
+      if (this.isCancelled(task.id)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled');
+        logger.info({ taskId: task.id }, 'Task cancelled during execution');
+        
+        await WorkerPool.completeTask(workerId, task.id, {
+          duration: Date.now() - startTime,
+          success: false,
+          retriesUsed: task.retries,
+          memory: 0,
+          cpu: 0,
+        });
+        return;
       }
 
       let shouldCompleteTask = true;
@@ -180,11 +230,17 @@ export class TaskExecutor {
             result: finalResult,
             completedAt: new Date(),
           });
+          await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result: finalResult });
           logger.info({ taskId: task.id, duration: Date.now() - startTime }, 'Task completed successfully');
         } else {
           // Non-consensus task failed: attempt retry; exhaust retries → DLQ.
           if (!task.consensus) {
              const retried = await TaskQueue.retryTask(task.id);
+             await TaskHooks.emitTask(retried ? 'task.retried' : 'task.failed', {
+                ...task,
+                status: retried ? 'retry' : 'failed',
+                error: finalError,
+             });
              if (!retried) {
                 await TaskQueue.updateTaskStatus(task.id, 'failed', {
                   error: finalError,
@@ -192,19 +248,20 @@ export class TaskExecutor {
                 });
              }
           } else {
-             // Consensus evaluation failed (e.g. no majority). Mark the task
-             // as failed directly — retrying individual workers independently
-             // would require resetting the consensus hash, which adds complexity.
-             // Callers should surface this as a task failure and re-submit if needed.
+             // Consensus evaluation failed
              await TaskQueue.updateTaskStatus(task.id, 'failed', {
                error: finalError,
                completedAt: new Date(),
+             });
+             await TaskHooks.emitTask('task.failed', {
+                ...task,
+                status: 'failed',
+                error: finalError,
              });
           }
           logger.error({ taskId: task.id, error: finalError, duration: Date.now() - startTime }, 'Task execution failed');
         }
       } else if (!shouldCompleteTask && executionError && !task.consensus) {
-        // Single-task handler threw but consensus count not checked (shouldn't happen, guard).
         logger.error({ taskId: task.id, error: finalError }, 'Unexpected state: handler errored without consensus');
       }
 
@@ -224,6 +281,11 @@ export class TaskExecutor {
       // Attempt to retry the task; if retries are exhausted move it to DLQ.
       try {
         const retried = await TaskQueue.retryTask(task.id);
+        await TaskHooks.emitTask(retried ? 'task.retried' : 'task.failed', {
+          ...task,
+          status: retried ? 'retry' : 'failed',
+          error: errorMessage,
+        });
         if (!retried) {
           await TaskQueue.updateTaskStatus(task.id, 'failed', {
             error: errorMessage,
@@ -243,11 +305,34 @@ export class TaskExecutor {
         cpu: 0,
       });
     } finally {
+      this.clearCancellation(task.id);
       const worker = await WorkerPool.getWorker(workerId);
       if (worker) {
         await WorkerPool.updateWorkerStatus(workerId, worker.currentTasks > 0 ? 'busy' : 'idle');
       }
     }
+  }
+
+  /**
+   * Execute a batch of tasks on a worker.
+   *
+   * Tasks run concurrently; each goes through the normal single-task lifecycle,
+   * so one task failing does not abort the others (partial-batch failure
+   * handling). Returns a summary with per-batch performance metrics.
+   */
+  static async executeBatch(
+    workerId: string,
+    tasks: Task[]
+  ): Promise<{ total: number; succeeded: number; failed: number; durationMs: number }> {
+    const start = Date.now();
+    const results = await Promise.allSettled(tasks.map((task) => this.execute(workerId, task)));
+
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    const succeeded = results.length - failed;
+    const durationMs = Date.now() - start;
+
+    logger.info({ workerId, total: tasks.length, succeeded, failed, durationMs }, 'Batch executed');
+    return { total: tasks.length, succeeded, failed, durationMs };
   }
 
   /**
