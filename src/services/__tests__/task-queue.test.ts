@@ -568,7 +568,9 @@ describe('TaskQueue Tests', () => {
     it('should allow task creation when queue size is below MAX_QUEUE_SIZE limit', async () => {
       process.env.MAX_QUEUE_SIZE = '100';
       const zCardSpy = jest.spyOn(mockRedisClient, 'zCard').mockResolvedValueOnce(99);
-      expect(mockRedisClient.lPush).toHaveBeenCalled();
+      const task = await TaskQueue.createTask('test-task', 'test-handler', {});
+      expect(task).toBeDefined();
+      zCardSpy.mockRestore();
     });
   });
 
