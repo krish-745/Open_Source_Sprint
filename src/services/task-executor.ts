@@ -37,6 +37,26 @@ export class TaskExecutor {
         throw new Error('Task timeout must be positive');
       }
 
+      // Check if task has expired before execution
+      if (task.ttl) {
+        const baseTime = task.scheduledFor ? new Date(task.scheduledFor).getTime() : new Date(task.createdAt).getTime();
+        const expiresAt = baseTime + task.ttl * 1000;
+        if (Date.now() > expiresAt) {
+          await TaskQueue.updateTaskStatus(task.id, 'cancelled', { error: 'Task expired before execution' });
+          
+          await WorkerPool.completeTask(workerId, task.id, {
+            duration: Date.now() - startTime,
+            success: false,
+            retriesUsed: task.retries,
+            memory: 0,
+            cpu: 0,
+          });
+
+          logger.warn({ taskId: task.id }, 'Task execution skipped due to expiration');
+          return;
+        }
+      }
+
       // Update task status
       await TaskQueue.updateTaskStatus(task.id, 'processing', {
         workerId,

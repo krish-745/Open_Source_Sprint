@@ -38,6 +38,7 @@ export class TaskQueue {
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
+      ttl?: number;
     } = {}
   ): Promise<Task> {
     const client = getRedisClient();
@@ -52,11 +53,20 @@ export class TaskQueue {
       throw new QueueFullError(queueName, maxQueueSize);
     }
 
+    const defaultTtlMap: Record<string, number> = {
+      critical: 86400, // 24 hours
+      high: 14400,    // 4 hours
+      medium: 7200,   // 2 hours
+      low: 3600,      // 1 hour
+    };
+    const priority = options.priority || 'medium';
+    const ttl = options.ttl !== undefined ? options.ttl : defaultTtlMap[priority];
+
     const task: Task = {
       id: taskId,
       name,
       description: `Task: ${name}`,
-      priority: options.priority || 'medium',
+      priority,
       status: 'pending',
       handler,
       payload,
@@ -70,6 +80,7 @@ export class TaskQueue {
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
+      ttl,
     };
 
     // Store task
@@ -190,6 +201,19 @@ export class TaskQueue {
     for (const taskId of taskIds) {
       const task = await this.getTask(taskId);
       if (!task) continue;
+
+      // Check if task is expired
+      if (task.ttl && (task.status === 'pending' || task.status === 'queued' || task.status === 'retry')) {
+        const baseTime = task.scheduledFor ? new Date(task.scheduledFor).getTime() : new Date(task.createdAt).getTime();
+        const expiresAt = baseTime + task.ttl * 1000;
+        if (Date.now() > expiresAt) {
+          await this.updateTaskStatus(taskId, 'cancelled', { error: 'Task expired before execution' });
+          await client.zRem(queueKey, taskId);
+          await client.incr('metrics:tasks:expired');
+          logger.warn({ taskId }, 'Task expired in queue before execution');
+          continue;
+        }
+      }
 
       // Skip if dependencies not met
       if (task.dependencies.length > 0) {
