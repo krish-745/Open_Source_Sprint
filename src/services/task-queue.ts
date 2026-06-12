@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { WatchError } from 'redis';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
 import { Task, TaskStatus, Queue, RecurrenceRule } from '../types';
@@ -136,37 +137,62 @@ export class TaskQueue {
   }
 
   /**
-   * Update task status
+   * Update task status atomically.
+   *
+   * Concurrent workers can update the same task at once. To avoid lost updates
+   * from a non-atomic read-modify-write, this uses Redis optimistic locking
+   * (WATCH/MULTI/EXEC): the task key is watched, mutated, and committed in a
+   * transaction. If another client modifies the key first, the transaction is
+   * aborted (WatchError) and the operation is retried on a fresh read.
    */
   static async updateTaskStatus(taskId: string, status: TaskStatus, metadata?: Record<string, any>): Promise<void> {
     const client = getRedisClient();
-    const task = await this.getTask(taskId);
+    const key = `${TASK_PREFIX}${taskId}`;
+    const maxAttempts = 5;
 
-    if (!task) {
-      throw new Error(`Task ${taskId} not found`);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await client.watch(key);
+
+      const data = await client.get(key);
+      if (!data) {
+        await client.unwatch();
+        throw new Error(`Task ${taskId} not found`);
+      }
+
+      const task: Task = JSON.parse(data);
+      const previousStatus = task.status;
+
+      task.status = status;
+      if (metadata) {
+        Object.assign(task, metadata);
+      }
+      if (status === 'completed') {
+        task.completedAt = new Date();
+      } else if (status === 'processing') {
+        task.startedAt = new Date();
+      }
+
+      try {
+        await client.multi().set(key, JSON.stringify(task)).exec();
+
+        // Keep queue stats consistent as the task moves between states.
+        if (previousStatus !== status) {
+          await this._transitionQueueStats(task.queue, previousStatus, status);
+        }
+
+        logger.info({ taskId, status }, 'Task status updated');
+        return;
+      } catch (error) {
+        if (error instanceof WatchError) {
+          // The task changed under us; retry with the latest value.
+          logger.warn({ taskId, attempt }, 'Concurrent task update detected, retrying');
+          continue;
+        }
+        throw error;
+      }
     }
 
-    const previousStatus = task.status;
-
-    task.status = status;
-    if (metadata) {
-      Object.assign(task, metadata);
-    }
-
-    if (status === 'completed') {
-      task.completedAt = new Date();
-    } else if (status === 'processing') {
-      task.startedAt = new Date();
-    }
-
-    await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
-
-    // Keep queue stats consistent as the task moves between states.
-    if (previousStatus !== status) {
-      await this._transitionQueueStats(task.queue, previousStatus, status);
-    }
-
-    logger.info({ taskId, status }, 'Task status updated');
+    throw new Error(`Failed to update task ${taskId} after ${maxAttempts} attempts due to concurrent modifications`);
   }
 
   /**
