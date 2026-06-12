@@ -1,5 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { TaskQueue, QueueFullError } from '../services/task-queue';
+import { TaskQueue, DependencyCycleError, QueueFullError } from '../services/task-queue';
 import { WorkerPool } from '../services/worker-pool';
 import { TaskExecutor } from '../services/task-executor';
 import { TaskScheduler } from '../services/task-scheduler';
@@ -33,7 +33,11 @@ router.post('/tasks', async (req: Request, res: Response) => {
       return res.status(400).json({ error: `Unknown handler: ${handler}` });
     }
 
-    const task = await TaskQueue.createTask(name, handler, payload || {}, {
+    if (payload !== undefined && payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) {
+      return res.status(400).json({ error: 'Payload must be a valid object' });
+    }
+
+    const task = await TaskQueue.createTask(name, handler, payload, {
       queueName,
       priority,
       maxRetries,
@@ -43,6 +47,9 @@ router.post('/tasks', async (req: Request, res: Response) => {
 
     res.status(201).json(task);
   } catch (error: any) {
+    if (error instanceof DependencyCycleError) {
+      return res.status(400).json({ error: error.message, cycle: error.cycle });
+    }
     logger.error({ error }, 'Create task error');
     
     if (error instanceof QueueFullError) {
@@ -105,6 +112,28 @@ router.get('/tasks/:taskId', async (req: Request, res: Response) => {
     res.json(task);
   } catch (error: any) {
     logger.error({ error }, 'Get task error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/tasks/:taskId/cancel', async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const cancelled = await TaskQueue.cancelTask(taskId);
+
+    // Signal any in-flight execution to stop cooperatively.
+    TaskExecutor.cancel(taskId);
+
+    if (!cancelled) {
+      return res.status(409).json({ error: 'Task cannot be cancelled (already finished)' });
+    }
+
+    res.json({ success: true, taskId });
+  } catch (error: any) {
+    if (error.message?.includes('not found')) {
+      return res.status(404).json({ error: error.message });
+    }
+    logger.error({ error }, 'Cancel task error');
     res.status(500).json({ error: error.message });
   }
 });
