@@ -23,6 +23,15 @@ export class DependencyCycleError extends Error {
   }
 }
 
+export class CircularDependencyError extends Error {
+  cycle: string[];
+  constructor(cycle: string[]) {
+    super(`Circular dependency detected: ${cycle.join(' -> ')}`);
+    this.name = 'CircularDependencyError';
+    this.cycle = cycle;
+  }
+}
+
 /**
  * Thrown when a queue has reached its maximum capacity (backpressure).
  * The API layer maps this to HTTP 429 Too Many Requests.
@@ -36,6 +45,43 @@ export class QueueFullError extends Error {
 
 export class TaskQueue {
   /**
+   * Check if adding proposed dependencies to a task would create a cycle
+   */
+  static async checkCircularDependencies(taskId: string, proposedDeps: string[]): Promise<string[] | null> {
+    const visited = new Set<string>();
+    const recStack = new Set<string>();
+    const path: string[] = [];
+
+    const detect = async (currentId: string): Promise<string[] | null> => {
+      visited.add(currentId);
+      recStack.add(currentId);
+      path.push(currentId);
+
+      const deps = (currentId === taskId) ? proposedDeps : (await this.getTask(currentId))?.dependencies || [];
+
+      for (const depId of deps) {
+        if (!visited.has(depId)) {
+          const cycle = await detect(depId);
+          if (cycle) return cycle;
+        } else if (recStack.has(depId)) {
+          const startIdx = path.indexOf(depId);
+          if (startIdx !== -1) {
+            return [...path.slice(startIdx), depId];
+          }
+          return [...path, depId];
+        }
+      }
+
+      recStack.delete(currentId);
+      path.pop();
+      return null;
+    };
+
+    return detect(taskId);
+  }
+
+  /**
+   * Create a new task and add it to the queue
    * Create a new task and add it to the queue.
    * The payload must be a valid JSON object. If null or undefined is provided, it defaults to an empty object.
    */
@@ -59,6 +105,15 @@ export class TaskQueue {
     const client = getRedisClient();
     const taskId = uuidv4();
     const queueName = options.queueName || 'default';
+    const dependencies = options.dependencies || [];
+
+    // Check for circular dependencies
+    if (dependencies.length > 0) {
+      const cycle = await this.checkCircularDependencies(taskId, dependencies);
+      if (cycle) {
+        throw new CircularDependencyError(cycle);
+      }
+    }
 
     if (payload !== undefined && payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) {
       throw new Error('Payload must be a valid object');
@@ -88,7 +143,7 @@ export class TaskQueue {
       timeout: options.timeout || 30000,
       createdAt,
       queue: queueName,
-      dependencies: options.dependencies || [],
+      dependencies,
       scheduledFor: options.scheduledFor,
       callbackUrl: options.callbackUrl,
       recurrence: options.recurrence,

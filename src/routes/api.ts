@@ -1,4 +1,5 @@
 import express, { Request, Response, NextFunction } from 'express';
+import { TaskQueue, CircularDependencyError, QueueFullError } from '../services/task-queue';
 import { TaskQueue, DependencyCycleError, QueueFullError } from '../services/task-queue';
 import { WorkerPool } from '../services/worker-pool';
 import { TaskExecutor } from '../services/task-executor';
@@ -43,6 +44,7 @@ router.get('/templates', (_req: Request, res: Response) => {
 
 router.post('/tasks', async (req: Request, res: Response) => {
   try {
+    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, dependencies } = req.body;
     const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, templateName } = req.body;
 
     // If a template is named, apply it for the handler/payload/priority.
@@ -64,6 +66,11 @@ router.post('/tasks', async (req: Request, res: Response) => {
       return res.status(400).json({ error: `Unknown handler: ${effectiveHandler}` });
     }
 
+    if (dependencies !== undefined && !Array.isArray(dependencies)) {
+      return res.status(400).json({ error: 'Dependencies must be an array of task IDs' });
+    }
+
+    const task = await TaskQueue.createTask(name, handler, payload || {}, {
     if (effectivePayload !== undefined && effectivePayload !== null && (typeof effectivePayload !== 'object' || Array.isArray(effectivePayload))) {
       return res.status(400).json({ error: 'Payload must be a valid object' });
     }
@@ -74,6 +81,7 @@ router.post('/tasks', async (req: Request, res: Response) => {
       maxRetries,
       timeout,
       tags,
+      dependencies,
     });
 
     res.status(201).json(task);
@@ -82,6 +90,12 @@ router.post('/tasks', async (req: Request, res: Response) => {
       return res.status(400).json({ error: error.message, cycle: error.cycle });
     }
     logger.error({ error }, 'Create task error');
+    if (error instanceof CircularDependencyError) {
+      return res.status(400).json({ error: error.message, cycle: error.cycle });
+    }
+    if (error instanceof QueueFullError) {
+      return res.status(429).json({ error: error.message });
+    }
 
     if (error instanceof QueueFullError) {
       return res.status(429).json({ error: error.message });
