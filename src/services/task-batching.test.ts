@@ -42,6 +42,7 @@ describe('TaskQueue.getNextBatch', () => {
       zRange: jest.fn().mockResolvedValue(ids),
       get: jest.fn((k: string) => Promise.resolve(store[k] ?? null)),
       zRem: jest.fn().mockResolvedValue(1),
+      mGet: jest.fn().mockResolvedValue([]),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
@@ -59,6 +60,7 @@ describe('TaskQueue.getNextBatch', () => {
       zRange: jest.fn().mockResolvedValue(['blocked', 'ready']),
       get: jest.fn((k: string) => Promise.resolve(store[k] ?? null)),
       zRem: jest.fn().mockResolvedValue(1),
+      mGet: jest.fn().mockImplementation(async (keys: string[]) => keys.map((k: string) => store[k] || null)),
     };
     mockedGetRedisClient.mockReturnValue(client);
 

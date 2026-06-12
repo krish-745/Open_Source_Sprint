@@ -5,6 +5,7 @@ import { TaskExecutor } from '../services/task-executor';
 import { TaskScheduler } from '../services/task-scheduler';
 import { MetricsCollector } from '../services/metrics-collector';
 import { getRedisStatus } from '../services/redis';
+import { TaskTemplates } from '../services/task-templates';
 import logger from '../utils/logger';
 
 const router = express.Router();
@@ -19,18 +20,48 @@ router.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+// Template endpoints
+
+router.post('/templates', (req: Request, res: Response) => {
+  try {
+    const { name, handler, priority, defaults, requiredFields } = req.body;
+    if (!name || !handler) {
+      return res.status(400).json({ error: 'Template requires name and handler' });
+    }
+    const template = TaskTemplates.register({ name, handler, priority, defaults, requiredFields });
+    res.status(201).json(template);
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+router.get('/templates', (_req: Request, res: Response) => {
+  res.json(TaskTemplates.list());
+});
+
 // Task endpoints
 
 router.post('/tasks', async (req: Request, res: Response) => {
   try {
-    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, consensus } = req.body;
+    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, templateName, consensus } = req.body;
 
-    if (!name || !handler) {
+    // If a template is named, apply it for the handler/payload/priority.
+    let effectiveHandler = handler;
+    let effectivePayload = payload || {};
+    let effectivePriority = priority;
+    if (templateName) {
+      const applied = TaskTemplates.apply(templateName, effectivePayload);
+      effectiveHandler = applied.handler;
+      effectivePayload = applied.payload;
+      effectivePriority = priority ?? applied.priority;
+    }
+
+    if (!name || !effectiveHandler) {
       return res.status(400).json({ error: 'Missing required fields: name, handler' });
     }
 
-    if (!TaskExecutor.hasHandler(handler)) {
-      return res.status(400).json({ error: `Unknown handler: ${handler}` });
+    if (!TaskExecutor.hasHandler(effectiveHandler)) {
+      return res.status(400).json({ error: `Unknown handler: ${effectiveHandler}` });
     }
 
     if (consensus !== undefined) {
@@ -43,13 +74,13 @@ router.post('/tasks', async (req: Request, res: Response) => {
       }
     }
 
-    if (payload !== undefined && payload !== null && (typeof payload !== 'object' || Array.isArray(payload))) {
+    if (effectivePayload !== undefined && effectivePayload !== null && (typeof effectivePayload !== 'object' || Array.isArray(effectivePayload))) {
       return res.status(400).json({ error: 'Payload must be a valid object' });
     }
 
-    const task = await TaskQueue.createTask(name, handler, payload, {
+    const task = await TaskQueue.createTask(name, effectiveHandler, effectivePayload, {
       queueName,
-      priority,
+      priority: effectivePriority,
       maxRetries,
       timeout,
       tags,
@@ -62,11 +93,14 @@ router.post('/tasks', async (req: Request, res: Response) => {
       return res.status(400).json({ error: error.message, cycle: error.cycle });
     }
     logger.error({ error }, 'Create task error');
-    
+
     if (error instanceof QueueFullError) {
       return res.status(429).json({ error: error.message });
     }
-    
+    if (error.message?.includes('Template') || error.message?.includes('required field')) {
+      return res.status(400).json({ error: error.message });
+    }
+
     res.status(500).json({ error: error.message });
   }
 });
@@ -133,6 +167,35 @@ router.get('/tasks/:taskId', async (req: Request, res: Response) => {
     res.json(task);
   } catch (error: any) {
     logger.error({ error }, 'Get task error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.patch('/tasks/:taskId', async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const { priority, timeout, maxRetries, tags, scheduledFor } = req.body;
+
+    const updated = await TaskQueue.updateTaskFields(taskId, {
+      priority,
+      timeout,
+      maxRetries,
+      tags,
+      scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
+    });
+
+    res.json(updated);
+  } catch (error: any) {
+    if (error.message?.includes('not found')) {
+      return res.status(404).json({ error: error.message });
+    }
+    if (error.message?.includes('cannot be modified')) {
+      return res.status(409).json({ error: error.message });
+    }
+    if (error.message?.includes('must be')) {
+      return res.status(400).json({ error: error.message });
+    }
+    logger.error({ error }, 'Update task error');
     res.status(500).json({ error: error.message });
   }
 });

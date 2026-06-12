@@ -39,7 +39,7 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       watch: jest.fn().mockResolvedValue('OK'),
       unwatch: jest.fn().mockResolvedValue('OK'),
       multi: jest.fn(() => {
-        const m: any = { set: () => m, exec: () => Promise.resolve([]) };
+        const m: any = { set: () => m, zAdd: () => m, zRem: () => m, exec: () => Promise.resolve([]) };
         return m;
       }),
       hIncrBy,
@@ -61,7 +61,7 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       watch: jest.fn().mockResolvedValue('OK'),
       unwatch: jest.fn().mockResolvedValue('OK'),
       multi: jest.fn(() => {
-        const m: any = { set: () => m, exec: () => Promise.resolve([]) };
+        const m: any = { set: () => m, zAdd: () => m, zRem: () => m, exec: () => Promise.resolve([]) };
         return m;
       }),
       hIncrBy,
@@ -83,7 +83,7 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       watch: jest.fn().mockResolvedValue('OK'),
       unwatch: jest.fn().mockResolvedValue('OK'),
       multi: jest.fn(() => {
-        const m: any = { set: () => m, exec: () => Promise.resolve([]) };
+        const m: any = { set: () => m, zAdd: () => m, zRem: () => m, exec: () => Promise.resolve([]) };
         return m;
       }),
       hIncrBy,

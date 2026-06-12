@@ -3,6 +3,7 @@ import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
 import { getRedisClient } from './redis';
+import { deliverCallback } from './task-callbacks';
 import { TaskHooks } from './task-hooks';
 
 export interface TaskExecutionContext {
@@ -231,6 +232,9 @@ export class TaskExecutor {
             completedAt: new Date(),
           });
           await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result: finalResult });
+          if (task.callbackUrl) {
+            await deliverCallback({ ...task, status: 'completed', completedAt: new Date() }, finalResult);
+          }
           logger.info({ taskId: task.id, duration: Date.now() - startTime }, 'Task completed successfully');
         } else {
           // Non-consensus task failed: attempt retry; exhaust retries → DLQ.
@@ -272,6 +276,7 @@ export class TaskExecutor {
         memory: 0,
         cpu: 0,
       });
+
 
     } catch (error: any) {
       const duration = Date.now() - startTime;

@@ -23,6 +23,7 @@ function makeFakeRedis() {
       strings.set(k, v);
       return 'OK';
     }),
+    mGet: jest.fn(async (keys: string[]) => keys.map((k: string) => strings.get(k) ?? null)),
     get: jest.fn(async (k: string) => strings.get(k) ?? null),
     del: jest.fn(async (k: string) => {
       strings.delete(k);
@@ -92,6 +93,8 @@ function makeFakeRedis() {
           operations.push(() => { strings.set(k, v); });
           return m;
         },
+        zAdd: () => m,
+        zRem: () => m,
         exec: async () => {
           for (const op of operations) op();
           return ['OK'];
