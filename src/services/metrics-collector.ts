@@ -37,7 +37,9 @@ export class MetricsCollector {
   // Maximum number of snapshots to retain. Older snapshots are pruned after
   // each capture so the snapshot set stays a bounded sliding window rather than
   // growing until the 7-day TTL expires.
-  private static maxSnapshots = 1000;
+  static maxSnapshots = parseInt(process.env.METRICS_MAX_SNAPSHOTS || '1000', 10);
+  static retentionTimeSeconds = parseInt(process.env.METRICS_RETENTION_TIME_SECONDS || '604800', 10);
+  static maxHeapMemoryBytes = parseInt(process.env.METRICS_MAX_HEAP_MEMORY_BYTES || '524288000', 10);
 
   /**
    * Configure how many snapshots to keep (sliding-window retention).
@@ -199,7 +201,7 @@ export class MetricsCollector {
 
     // Store snapshot
     const snapshotKey = `${SNAPSHOT_PREFIX}${Date.now()}`;
-    await client.set(snapshotKey, JSON.stringify(metrics), { EX: 7 * 24 * 60 * 60 });
+    await client.set(snapshotKey, JSON.stringify(metrics), { EX: MetricsCollector.retentionTimeSeconds });
 
     // Enforce the retention window so snapshots don't accumulate unbounded.
     await this._pruneOldSnapshots();
@@ -297,6 +299,12 @@ export class MetricsCollector {
       if (dlqSize > 100) {
         health = health === 'critical' ? 'critical' : 'degraded';
         issues.push(`High DLQ size: ${dlqSize}`);
+      }
+
+      const heapUsed = snapshot.system?.memoryUsage?.heapUsed || 0;
+      if (heapUsed > MetricsCollector.maxHeapMemoryBytes) {
+        health = health === 'critical' ? 'critical' : 'degraded';
+        issues.push(`High heap memory usage: ${Math.round(heapUsed / (1024 * 1024))} MB`);
       }
 
       return {

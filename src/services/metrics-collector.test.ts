@@ -58,3 +58,72 @@ describe('MetricsCollector.getLatestSnapshot', () => {
     expect(await MetricsCollector.getLatestSnapshot()).toBeNull();
   });
 });
+
+describe('MetricsCollector Retention and Memory Warnings', () => {
+  let mockClient: any;
+
+  beforeEach(() => {
+    mockClient = {
+      keys: jest.fn().mockResolvedValue([]),
+      get: jest.fn(),
+      set: jest.fn().mockResolvedValue('OK'),
+      del: jest.fn().mockResolvedValue(1),
+      zRange: jest.fn().mockResolvedValue([]),
+      zCard: jest.fn().mockResolvedValue(0),
+      lLen: jest.fn().mockResolvedValue(0),
+    };
+    mockedGetRedisClient.mockReturnValue(mockClient);
+    MetricsCollector.maxSnapshots = 1000;
+    MetricsCollector.maxHeapMemoryBytes = 524288000;
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('should clean up the oldest snapshots when maxSnapshots is exceeded', async () => {
+    MetricsCollector.maxSnapshots = 2;
+    const existingSnapshots = [
+      'snapshot:100',
+      'snapshot:200',
+      'snapshot:300',
+      'snapshot:400',
+    ];
+    mockClient.keys.mockImplementation(async (pattern: string) => {
+      if (pattern.startsWith('snapshot:')) {
+        return existingSnapshots;
+      }
+      return [];
+    });
+
+    await MetricsCollector.captureSnapshot();
+
+    expect(mockClient.del).toHaveBeenCalledWith('snapshot:100');
+    expect(mockClient.del).toHaveBeenCalledWith('snapshot:200');
+    expect(mockClient.del).not.toHaveBeenCalledWith('snapshot:300');
+    expect(mockClient.del).not.toHaveBeenCalledWith('snapshot:400');
+  });
+
+  it('should degrade system health when memory usage is too high', async () => {
+    MetricsCollector.maxHeapMemoryBytes = 100 * 1024 * 1024; // 100 MB
+    const snapshotWithHighMemory = {
+      timestamp: new Date(),
+      queues: {},
+      workers: {
+        'worker-1': { status: 'online' }
+      },
+      tasks: { deadLetterQueueSize: 0 },
+      system: {
+        memoryUsage: { heapUsed: 150 * 1024 * 1024 } // 150 MB
+      }
+    };
+
+    mockClient.keys.mockResolvedValue(['snapshot:1700000000000']);
+    mockClient.get.mockResolvedValue(JSON.stringify(snapshotWithHighMemory));
+
+    const health = await MetricsCollector.getHealthStatus();
+
+    expect(health.status).toBe('degraded');
+    expect(health.issues).toContain('High heap memory usage: 150 MB');
+  });
+});
