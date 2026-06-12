@@ -2,6 +2,7 @@ import logger from '../utils/logger';
 import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
+import { deliverCallback } from './task-callbacks';
 import { TaskHooks } from './task-hooks';
 
 export interface TaskExecutionContext {
@@ -113,6 +114,11 @@ export class TaskExecutor {
       });
 
       await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result });
+
+      // Best-effort: POST the result to the task's callback URL if set.
+      if (task.callbackUrl) {
+        await deliverCallback({ ...task, status: 'completed', completedAt: new Date() }, result);
+      }
 
       logger.info({ taskId: task.id, duration }, 'Task completed successfully');
     } catch (error: any) {

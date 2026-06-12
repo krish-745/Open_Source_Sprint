@@ -50,6 +50,7 @@ export class TaskQueue {
       timeout?: number;
       dependencies?: string[];
       scheduledFor?: Date;
+      callbackUrl?: string;
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
@@ -89,6 +90,7 @@ export class TaskQueue {
       queue: queueName,
       dependencies: options.dependencies || [],
       scheduledFor: options.scheduledFor,
+      callbackUrl: options.callbackUrl,
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
