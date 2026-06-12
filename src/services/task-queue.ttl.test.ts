@@ -36,6 +36,8 @@ describe('TaskQueue TTL', () => {
       zAdd: jest.fn().mockResolvedValue(1),
       zCard: jest.fn().mockResolvedValue(0),
       hIncrBy: jest.fn().mockResolvedValue(1),
+      hGet: jest.fn().mockResolvedValue(null),
+      multi: jest.fn(() => ({ zRem: jest.fn().mockReturnThis(), zAdd: jest.fn().mockReturnThis(), set: jest.fn().mockReturnThis(), hIncrBy: jest.fn().mockReturnThis(), exec: jest.fn().mockResolvedValue([]) })),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
@@ -51,6 +53,8 @@ describe('TaskQueue TTL', () => {
       zAdd: jest.fn().mockResolvedValue(1),
       zCard: jest.fn().mockResolvedValue(0),
       hIncrBy: jest.fn().mockResolvedValue(1),
+      hGet: jest.fn().mockResolvedValue(null),
+      multi: jest.fn(() => ({ zRem: jest.fn().mockReturnThis(), zAdd: jest.fn().mockReturnThis(), set: jest.fn().mockReturnThis(), hIncrBy: jest.fn().mockReturnThis(), exec: jest.fn().mockResolvedValue([]) })),
     };
     mockedGetRedisClient.mockReturnValue(client);
 

@@ -2,13 +2,15 @@ import { v4 as uuidv4 } from 'uuid';
 import { WatchError } from 'redis';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
-import { Task, TaskStatus, Queue, RecurrenceRule, TaskBranch } from '../types';
+import { Task, TaskStatus, Queue, RecurrenceRule, ConsensusOptions, TaskBranch } from '../types';
 
 const TASK_PREFIX = 'task:';
 const QUEUE_PREFIX = 'queue:';
 const QUEUE_LIST_KEY = 'queues:all';
 const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
+const TASK_STATUS_INDEX_PREFIX = 'tasks:status:';
+const TASK_QUEUE_STATUS_INDEX_PREFIX = 'tasks:queue:';
 
 // Default time-to-live (seconds) per priority, used when a task is created
 // without an explicit ttl. Higher-priority tasks are given longer to start.
@@ -58,9 +60,11 @@ export class TaskQueue {
       dependencies?: string[];
       scheduledFor?: Date;
       ttl?: number;
+      callbackUrl?: string;
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
+      consensus?: ConsensusOptions;
     } = {}
   ): Promise<Task> {
     const client = getRedisClient();
@@ -85,6 +89,7 @@ export class TaskQueue {
     if (currentSize >= maxQueueSize) {
       throw new QueueFullError(queueName, maxQueueSize);
     }
+
     const task: Task = {
       id: taskId,
       name,
@@ -102,9 +107,11 @@ export class TaskQueue {
       scheduledFor: options.scheduledFor,
       ttl,
       expiresAt,
+      callbackUrl: options.callbackUrl,
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
+      consensus: options.consensus,
     };
 
     // Reject tasks that would introduce a circular dependency.
@@ -118,11 +125,16 @@ export class TaskQueue {
       }
     }
 
+    const timestamp = createdAt.getTime();
+
     // Store task
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
     // Add to task index
-    await client.zAdd(TASK_INDEX_KEY, { score: Date.now(), value: taskId });
+    await client.zAdd(TASK_INDEX_KEY, { score: timestamp, value: taskId });
+
+    // Add to secondary indices (status and queue+status)
+    await this._updateTaskIndices(taskId, queueName, timestamp, task.status);
 
     // Add to queue
     const score = this._calculateQueueScore(task.priority);
@@ -137,10 +149,6 @@ export class TaskQueue {
 
   /**
    * Create multiple tasks in one call.
-   *
-   * Validates every input up front (non-empty, within the 1000-task limit, each
-   * with a name and handler) so the batch is rejected before anything is
-   * written if any entry is invalid. Returns the created tasks in order.
    */
   static async createTasksBatch(
     inputs: Array<{
@@ -173,11 +181,7 @@ export class TaskQueue {
   }
 
   /**
-   * Evaluate a task's conditional branches against its result and return the
-   * branches that match, so the caller can enqueue the next step(s). A
-   * condition prefixed with `regex:` is matched as a regular expression against
-   * the stringified result; otherwise a substring match is used. Multiple
-   * branches may match.
+   * Evaluate a task's conditional branches against its result
    */
   static evaluateBranches(task: Task, result: any): TaskBranch[] {
     if (!task.branches || task.branches.length === 0) {
@@ -207,13 +211,78 @@ export class TaskQueue {
   }
 
   /**
-   * Update task status atomically.
+   * Modify a not-yet-executed task's parameters.
    *
-   * Concurrent workers can update the same task at once. To avoid lost updates
-   * from a non-atomic read-modify-write, this uses Redis optimistic locking
-   * (WATCH/MULTI/EXEC): the task key is watched, mutated, and committed in a
-   * transaction. If another client modifies the key first, the transaction is
-   * aborted (WatchError) and the operation is retried on a fresh read.
+   * Only the whitelisted fields (`priority`, `timeout`, `maxRetries`, `tags`,
+   * `scheduledFor`) may be changed, and only while the task has not started
+   * (status pending/queued/blocked). An audit entry is appended to the task's
+   * metadata for every change. Returns the updated task; throws if the task is
+   * missing or already executing/finished.
+   */
+  static async updateTaskFields(
+    taskId: string,
+    fields: {
+      priority?: 'low' | 'medium' | 'high' | 'critical';
+      timeout?: number;
+      maxRetries?: number;
+      tags?: string[];
+      scheduledFor?: Date;
+    }
+  ): Promise<Task> {
+    const client = getRedisClient();
+    const task = await this.getTask(taskId);
+
+    if (!task) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+
+    const modifiable = ['pending', 'queued', 'blocked'];
+    if (!modifiable.includes(task.status)) {
+      throw new Error(`Task ${taskId} cannot be modified in status '${task.status}'`);
+    }
+
+    if (fields.timeout !== undefined && fields.timeout <= 0) {
+      throw new Error('timeout must be positive');
+    }
+    if (fields.maxRetries !== undefined && fields.maxRetries < 0) {
+      throw new Error('maxRetries must be non-negative');
+    }
+
+    const changes: Record<string, { from: any; to: any }> = {};
+    const apply = <K extends keyof Task>(key: K, value: Task[K] | undefined) => {
+      if (value !== undefined && task[key] !== value) {
+        changes[key as string] = { from: task[key], to: value };
+        task[key] = value;
+      }
+    };
+
+    apply('priority', fields.priority);
+    apply('timeout', fields.timeout);
+    apply('maxRetries', fields.maxRetries);
+    apply('tags', fields.tags);
+    apply('scheduledFor', fields.scheduledFor);
+
+    if (Object.keys(changes).length > 0) {
+      const audit = (task.metadata.auditLog as any[]) || [];
+      audit.push({ at: new Date().toISOString(), changes });
+      task.metadata.auditLog = audit;
+
+      await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
+
+      // Re-score the queue entry if priority changed.
+      if (changes.priority) {
+        const queueKey = `${QUEUE_PREFIX}${task.queue}`;
+        await client.zAdd(queueKey, { score: this._calculateQueueScore(task.priority), value: taskId });
+      }
+
+      logger.info({ taskId, changed: Object.keys(changes) }, 'Task fields updated');
+    }
+
+    return task;
+  }
+
+  /**
+   * Update task status atomically.
    */
   static async updateTaskStatus(taskId: string, status: TaskStatus, metadata?: Record<string, any>): Promise<void> {
     const client = getRedisClient();
@@ -243,7 +312,18 @@ export class TaskQueue {
       }
 
       try {
-        await client.multi().set(key, JSON.stringify(task)).exec();
+        const timestamp = new Date(task.createdAt).getTime();
+        const multi = client.multi().set(key, JSON.stringify(task));
+
+        // Incorporate index updates directly into the optimistic locking transaction
+        if (previousStatus !== status) {
+          multi.zRem(`${TASK_STATUS_INDEX_PREFIX}${previousStatus}`, taskId);
+          multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${previousStatus}`, taskId);
+          multi.zAdd(`${TASK_STATUS_INDEX_PREFIX}${status}`, { score: timestamp, value: taskId });
+          multi.zAdd(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${status}`, { score: timestamp, value: taskId });
+        }
+
+        await multi.exec();
 
         // Keep queue stats consistent as the task moves between states.
         if (previousStatus !== status) {
@@ -254,7 +334,6 @@ export class TaskQueue {
         return;
       } catch (error) {
         if (error instanceof WatchError) {
-          // The task changed under us; retry with the latest value.
           logger.warn({ taskId, attempt }, 'Concurrent task update detected, retrying');
           continue;
         }
@@ -267,72 +346,110 @@ export class TaskQueue {
 
   /**
    * Get next task from queue.
-   *
-   * Priority semantics: tasks are ordered by a priority-derived score
-   * (critical > high > medium > low) in the queue sorted set, and this returns
-   * the highest-priority task that is actually runnable (dependencies met and
-   * not scheduled for the future). The full queue is scanned in priority order
-   * rather than only the top N, so a runnable high-priority task is never
-   * skipped because lower-priority or blocked tasks happen to sort ahead in a
-   * truncated window — i.e. no priority inversion.
    */
   static async getNextTask(queueName: string): Promise<Task | null> {
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
-    // Scan the whole queue from highest to lowest priority.
-    const taskIds = await client.zRange(queueKey, 0, -1, { REV: true });
+    const CHUNK_SIZE = 50;
+    let offset = 0;
+    let hasMore = true;
 
-    for (const taskId of taskIds) {
-      const task = await this.getTask(taskId);
-      if (!task) continue;
+    while (hasMore) {
+      const taskIds = await client.zRange(queueKey, offset, offset + CHUNK_SIZE - 1, { REV: true });
+      if (taskIds.length === 0) break;
 
-      // Skip if dependencies not met
-      if (task.dependencies.length > 0) {
-        const depsResolved = await this._checkDependencies(task.dependencies);
-        if (!depsResolved) continue;
+      for (const taskId of taskIds) {
+        const task = await this.getTask(taskId);
+        if (!task) continue;
+
+        if (task.dependencies.length > 0) {
+          const depsResolved = await this._checkDependencies(task.dependencies);
+          if (!depsResolved) continue;
+        }
+
+        if (task.scheduledFor && new Date(task.scheduledFor) > new Date()) {
+          continue;
+        }
+
+        // Try to acquire the task atomically
+        if (task.consensus) {
+          const dispatchKey = `${QUEUE_PREFIX}${queueName}:dispatch`;
+          const count = await client.hIncrBy(dispatchKey, taskId, 1);
+          if (count <= task.consensus.workers) {
+            if (count === task.consensus.workers) {
+              // Last worker needed for consensus has picked it up; remove from queue
+              await client.zRem(queueKey, taskId);
+            }
+            return task;
+          }
+        } else {
+          const removed = await client.zRem(queueKey, taskId);
+          if (removed === 1) {
+            return task;
+          }
+        }
       }
 
-      // Skip if scheduled for later
-      if (task.scheduledFor && new Date(task.scheduledFor) > new Date()) {
-        continue;
-      }
-
-      return task;
+      offset += CHUNK_SIZE;
+      hasMore = taskIds.length === CHUNK_SIZE;
     }
 
     return null;
   }
 
   /**
-   * Fetch up to `batchSize` runnable tasks from a queue in priority order, for
-   * workers that process tasks in batches. Applies the same runnability rules
-   * as getNextTask (dependencies met, not scheduled for later).
+   * Fetch up to `batchSize` runnable tasks from a queue in priority order.
    */
   static async getNextBatch(queueName: string, batchSize: number = 10): Promise<Task[]> {
-    if (batchSize < 1) {
-      return [];
-    }
+    if (batchSize < 1) return [];
+    
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
-    const taskIds = await client.zRange(queueKey, 0, -1, { REV: true });
-
     const batch: Task[] = [];
-    for (const taskId of taskIds) {
-      if (batch.length >= batchSize) break;
+    
+    const CHUNK_SIZE = 50;
+    let offset = 0;
+    let hasMore = true;
 
-      const task = await this.getTask(taskId);
-      if (!task) continue;
+    while (hasMore && batch.length < batchSize) {
+      const taskIds = await client.zRange(queueKey, offset, offset + CHUNK_SIZE - 1, { REV: true });
+      if (taskIds.length === 0) break;
 
-      if (task.dependencies.length > 0) {
-        const depsResolved = await this._checkDependencies(task.dependencies);
-        if (!depsResolved) continue;
+      for (const taskId of taskIds) {
+        if (batch.length >= batchSize) break;
+
+        const task = await this.getTask(taskId);
+        if (!task) continue;
+
+        if (task.dependencies.length > 0) {
+          const depsResolved = await this._checkDependencies(task.dependencies);
+          if (!depsResolved) continue;
+        }
+        if (task.scheduledFor && new Date(task.scheduledFor) > new Date()) {
+          continue;
+        }
+
+        // Try to acquire the task atomically
+        if (task.consensus) {
+          const dispatchKey = `${QUEUE_PREFIX}${queueName}:dispatch`;
+          const count = await client.hIncrBy(dispatchKey, taskId, 1);
+          if (count <= task.consensus.workers) {
+            if (count === task.consensus.workers) {
+              await client.zRem(queueKey, taskId);
+            }
+            batch.push(task);
+          }
+        } else {
+          const removed = await client.zRem(queueKey, taskId);
+          if (removed === 1) {
+            batch.push(task);
+          }
+        }
       }
-      if (task.scheduledFor && new Date(task.scheduledFor) > new Date()) {
-        continue;
-      }
-
-      batch.push(task);
+      
+      offset += CHUNK_SIZE;
+      hasMore = taskIds.length === CHUNK_SIZE;
     }
 
     return batch;
@@ -354,24 +471,35 @@ export class TaskQueue {
       return false;
     }
 
+    const previousStatus = task.status;
     task.retries += 1;
     task.status = 'retry';
     delete task.error;
 
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
+    // Synchronize indices safely
+    await this._updateTaskIndices(
+      taskId, 
+      task.queue, 
+      new Date(task.createdAt).getTime(), 
+      task.status, 
+      previousStatus
+    );
+
     const queueKey = `${QUEUE_PREFIX}${task.queue}`;
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
+    await client.hDel(`${queueKey}:dispatch`, taskId);
+    await client.del(`task:${taskId}:consensus`);
 
     logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
     return true;
   }
 
   /**
-   * Cancel a task. Terminal tasks (completed/failed/already cancelled) cannot
-   * be cancelled and return false. Otherwise the task is marked `cancelled` and
-   * removed from its queue so it won't be dispatched. Returns true on success.
+   * Get tasks from queue, with optional filters
+   * Cancel a task.
    */
   static async cancelTask(taskId: string): Promise<boolean> {
     const client = getRedisClient();
@@ -385,9 +513,21 @@ export class TaskQueue {
       return false;
     }
 
+    const previousStatus = task.status;
     task.status = 'cancelled';
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
     await client.zRem(`${QUEUE_PREFIX}${task.queue}`, taskId);
+    await client.hDel(`${QUEUE_PREFIX}${task.queue}:dispatch`, taskId);
+    await client.del(`task:${taskId}:consensus`);
+
+    // Synchronize indices safely
+    await this._updateTaskIndices(
+      taskId, 
+      task.queue, 
+      new Date(task.createdAt).getTime(), 
+      task.status, 
+      previousStatus
+    );
 
     logger.info({ taskId }, 'Task cancelled');
     return true;
@@ -396,19 +536,114 @@ export class TaskQueue {
   /**
    * Get all tasks from queue
    */
-  static async getQueueTasks(queueName: string, limit: number = 100, offset: number = 0): Promise<Task[]> {
+  static async getQueueTasks(
+    queueName: string,
+    limit: number = 100,
+    offset: number = 0,
+    filters: {
+      status?: string | string[];
+      priority?: string | string[];
+      tags?: string | string[];
+      startDate?: Date;
+      endDate?: Date;
+    } = {}
+  ): Promise<Task[]> {
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
-    const taskIds = await client.zRange(queueKey, offset, offset + limit - 1, { REV: true });
-    const tasks: Task[] = [];
+    const hasFilters =
+      filters.status ||
+      filters.priority ||
+      filters.tags ||
+      filters.startDate ||
+      filters.endDate;
 
-    for (const taskId of taskIds) {
-      const task = await this.getTask(taskId);
-      if (task) tasks.push(task);
+    if (!hasFilters) {
+      const taskIds = await client.zRange(queueKey, offset, offset + limit - 1, { REV: true });
+      const tasks: Task[] = [];
+
+      for (const taskId of taskIds) {
+        const task = await this.getTask(taskId);
+        if (task) tasks.push(task);
+      }
+
+      return tasks;
     }
 
-    return tasks;
+    // Retrieve all tasks to filter them in memory
+    const allTaskIds = await client.zRange(queueKey, 0, -1, { REV: true });
+    const filteredTasks: Task[] = [];
+
+    for (const taskId of allTaskIds) {
+      const task = await this.getTask(taskId);
+      if (!task) continue;
+
+      // Filter by status (AND logic)
+      if (filters.status) {
+        const statuses = Array.isArray(filters.status) ? filters.status : [filters.status];
+        if (!statuses.includes(task.status)) continue;
+      }
+
+      // Filter by priority (AND logic)
+      if (filters.priority) {
+        const priorities = Array.isArray(filters.priority) ? filters.priority : [filters.priority];
+        if (!priorities.includes(task.priority)) continue;
+      }
+
+      // Filter by tags (AND logic: must match all specified tags)
+      if (filters.tags) {
+        const requiredTags = Array.isArray(filters.tags) ? filters.tags : [filters.tags];
+        const hasAllTags = requiredTags.every(tag => task.tags.includes(tag));
+        if (!hasAllTags) continue;
+      }
+
+      // Filter by date range (AND logic)
+      if (filters.startDate) {
+        if (new Date(task.createdAt) < new Date(filters.startDate)) continue;
+      }
+      if (filters.endDate) {
+        if (new Date(task.createdAt) > new Date(filters.endDate)) continue;
+      }
+
+      filteredTasks.push(task);
+    }
+
+    // Apply offset and limit
+    return filteredTasks.slice(offset, offset + limit);
+    const taskIds = await client.zRange(queueKey, offset, offset + limit - 1, { REV: true });
+    return this._fetchTasksByIds(taskIds);
+  }
+
+  /**
+   * Query tasks by status globally (O(log n))
+   */
+  static async getTasksByStatus(status: TaskStatus, limit: number = 100, offset: number = 0): Promise<Task[]> {
+    const client = getRedisClient();
+    const key = `${TASK_STATUS_INDEX_PREFIX}${status}`;
+    const taskIds = await client.zRange(key, offset, offset + limit - 1, { REV: true });
+    return this._fetchTasksByIds(taskIds);
+  }
+
+  /**
+   * Query tasks by queue and status (O(log n))
+   */
+  static async getTasksByQueueAndStatus(queueName: string, status: TaskStatus, limit: number = 100, offset: number = 0): Promise<Task[]> {
+    const client = getRedisClient();
+    const key = `${TASK_QUEUE_STATUS_INDEX_PREFIX}${queueName}:status:${status}`;
+    const taskIds = await client.zRange(key, offset, offset + limit - 1, { REV: true });
+    return this._fetchTasksByIds(taskIds);
+  }
+
+  /**
+   * Query tasks by creation time (O(log n))
+   */
+  static async getTasksByCreationTime(startTime: number, endTime: number, limit: number = 100, offset: number = 0): Promise<Task[]> {
+    const client = getRedisClient();
+    const taskIds = await client.zRange(TASK_INDEX_KEY, startTime, endTime, {
+      BY: 'SCORE',
+      LIMIT: { offset, count: limit }
+    });
+    return this._fetchTasksByIds(taskIds);
   }
 
   /**
@@ -444,10 +679,16 @@ export class TaskQueue {
 
     for (const taskId of allTaskIds) {
       const task = await this.getTask(taskId);
-      if (task && (task.status === 'completed' || task.status === 'failed')) {
+      if (task && (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')) {
         await client.del(`${TASK_PREFIX}${taskId}`);
         await client.zRem(TASK_INDEX_KEY, taskId);
+        await client.hDel(`${QUEUE_PREFIX}${task.queue}:dispatch`, taskId);
+        await client.del(`task:${taskId}:consensus`);
+        await this._removeTaskFromIndices(taskId, task.queue, task.status);
         deleted++;
+      } else if (!task) {
+        // Orphaned index cleanup
+        await client.zRem(TASK_INDEX_KEY, taskId);
       }
     }
 
@@ -497,6 +738,55 @@ export class TaskQueue {
   }
 
   /**
+   * Search tasks by name and description.
+   * Compares the search term case-insensitively using simple string inclusion to handle special characters safely.
+   * Returns matching task IDs along with a relevance score (exact name match = 10, partial name match = 5, description match = 2).
+   */
+  static async searchTasks(
+    searchTerm: string,
+    limit: number = 50
+  ): Promise<{ taskId: string; score: number }[]> {
+    const client = getRedisClient();
+    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+
+    const results: { taskId: string; score: number }[] = [];
+    const term = searchTerm.toLowerCase().trim();
+    if (!term) return [];
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (!task) continue;
+
+      const name = (task.name || '').toLowerCase();
+      const description = (task.description || '').toLowerCase();
+
+      let score = 0;
+
+      // Check name match
+      if (name === term) {
+        score += 10;
+      } else if (name.includes(term)) {
+        score += 5;
+      }
+
+      // Check description match
+      if (description.includes(term)) {
+        score += 2;
+      }
+
+      if (score > 0) {
+        results.push({ taskId, score });
+      }
+    }
+
+    // Sort by relevance score (highest first)
+    results.sort((a, b) => b.score - a.score);
+
+    // Limit results to prevent performance issues
+    return results.slice(0, limit);
+  }
+
+  /**
    * Put a task back on its queue for another worker to pick up, clearing any
    * previous worker assignment. Used when a worker disconnects mid-execution.
    * Returns false if the task no longer exists.
@@ -508,13 +798,24 @@ export class TaskQueue {
       return false;
     }
 
+    const previousStatus = task.status;
     task.status = 'queued';
     task.workerId = undefined;
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
+    // Synchronize indices safely
+    await this._updateTaskIndices(
+      taskId, 
+      task.queue, 
+      new Date(task.createdAt).getTime(), 
+      task.status, 
+      previousStatus
+    );
+
     const queueKey = `${QUEUE_PREFIX}${task.queue}`;
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
+    await client.hDel(`${queueKey}:dispatch`, taskId);
 
     logger.info({ taskId }, 'Task requeued');
     return true;
@@ -522,15 +823,13 @@ export class TaskQueue {
 
   /**
    * Recover tasks orphaned by a crashed worker.
-   *
-   * A task whose worker dies stays in "processing" forever. This finds tasks
-   * that have been processing longer than `staleMs`, resets them to "queued",
-   * detaches the dead worker, and re-enqueues them so another worker can pick
-   * them up. Returns the number of tasks recovered.
    */
   static async recoverStaleTasks(staleMs: number = 5 * 60 * 1000): Promise<number> {
     const client = getRedisClient();
-    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+    // Efficiently query only tasks that are 'processing'
+    const processingKey = `${TASK_STATUS_INDEX_PREFIX}processing`;
+    const taskIds = await client.zRange(processingKey, 0, -1);
+    
     const now = Date.now();
     let recovered = 0;
 
@@ -546,13 +845,25 @@ export class TaskQueue {
       }
 
       const previousWorker = task.workerId;
+      const previousStatus = task.status;
+
       task.status = 'queued';
       task.workerId = undefined;
       await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
 
+      // Synchronize indices safely
+      await this._updateTaskIndices(
+        taskId, 
+        task.queue, 
+        new Date(task.createdAt).getTime(), 
+        task.status, 
+        previousStatus
+      );
+
       const queueKey = `${QUEUE_PREFIX}${task.queue}`;
       const score = this._calculateQueueScore(task.priority);
       await client.zAdd(queueKey, { score, value: taskId });
+      await client.hDel(`${queueKey}:dispatch`, taskId);
 
       recovered++;
       logger.warn(
@@ -567,7 +878,56 @@ export class TaskQueue {
     return recovered;
   }
 
-  // Private helper methods
+  // --- Private helper methods ---
+
+  /**
+   * Batch resolves an array of IDs into full Task objects efficiently
+   */
+  private static async _fetchTasksByIds(taskIds: string[]): Promise<Task[]> {
+    if (taskIds.length === 0) return [];
+    const client = getRedisClient();
+    const keys = taskIds.map(id => `${TASK_PREFIX}${id}`);
+    const dataList = await client.mGet(keys);
+
+    return dataList
+      .filter((data): data is string => data !== null)
+      .map((data) => JSON.parse(data));
+  }
+
+  /**
+   * Synchronize all status and queue search ZSET indices via Redis pipelines
+   */
+  private static async _updateTaskIndices(
+    taskId: string,
+    queueName: string,
+    timestamp: number,
+    newStatus: string,
+    oldStatus?: string
+  ): Promise<void> {
+    const client = getRedisClient();
+    const multi = client.multi();
+
+    if (oldStatus && oldStatus !== newStatus) {
+      multi.zRem(`${TASK_STATUS_INDEX_PREFIX}${oldStatus}`, taskId);
+      multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${queueName}:status:${oldStatus}`, taskId);
+    }
+
+    multi.zAdd(`${TASK_STATUS_INDEX_PREFIX}${newStatus}`, { score: timestamp, value: taskId });
+    multi.zAdd(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${queueName}:status:${newStatus}`, { score: timestamp, value: taskId });
+
+    await multi.exec();
+  }
+
+  /**
+   * Purge a task from the search indices entirely
+   */
+  private static async _removeTaskFromIndices(taskId: string, queueName: string, status: string): Promise<void> {
+    const client = getRedisClient();
+    const multi = client.multi();
+    multi.zRem(`${TASK_STATUS_INDEX_PREFIX}${status}`, taskId);
+    multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${queueName}:status:${status}`, taskId);
+    await multi.exec();
+  }
 
   private static _calculateQueueScore(priority: string): number {
     const priorityMap: Record<string, number> = {
@@ -579,14 +939,6 @@ export class TaskQueue {
     return (priorityMap[priority] || 10) + Math.random();
   }
 
-  /**
-   * Detect a circular dependency reachable from a new task using depth-first
-   * search. The new task (`rootId`) is treated as a graph node whose edges are
-   * its declared `rootDeps`; every other node's edges are read from the stored
-   * task's `dependencies`. Returns the cycle as an ordered list of task ids, or
-   * `null` if the dependency graph is acyclic. Transitive dependencies are
-   * followed, and missing/unknown dependencies are treated as leaf nodes.
-   */
   private static async _detectDependencyCycle(
     rootId: string,
     rootDeps: string[]
@@ -625,12 +977,22 @@ export class TaskQueue {
   }
 
   private static async _checkDependencies(dependencyIds: string[]): Promise<boolean> {
-    for (const depId of dependencyIds) {
-      const task = await this.getTask(depId);
-      if (!task || task.status !== 'completed') {
+    if (dependencyIds.length === 0) return true;
+
+    const client = getRedisClient();
+    const keys = dependencyIds.map(id => `${TASK_PREFIX}${id}`);
+    
+    // Fetch all dependencies in one network call
+    const dataList = await client.mGet(keys);
+
+    for (const data of dataList) {
+      if (!data) return false;
+      const task: Task = JSON.parse(data);
+      if (task.status !== 'completed') {
         return false;
       }
     }
+    
     return true;
   }
 
@@ -639,9 +1001,16 @@ export class TaskQueue {
     const task = await this.getTask(taskId);
 
     if (task) {
+      const previousStatus = task.status;
       task.status = 'failed';
       await client.lPush(DEAD_LETTER_QUEUE, JSON.stringify(task));
       await client.del(`${TASK_PREFIX}${taskId}`);
+      await client.hDel(`${QUEUE_PREFIX}${task.queue}:dispatch`, taskId);
+      await client.del(`task:${taskId}:consensus`);
+      
+      // Clear out the indices completely since this entry is deleted from the primary task space
+      await client.zRem(TASK_INDEX_KEY, taskId);
+      await this._removeTaskFromIndices(taskId, task.queue, previousStatus);
       logger.warn({ taskId }, 'Task moved to DLQ');
     }
   }
@@ -661,9 +1030,7 @@ export class TaskQueue {
   ];
 
   /**
-   * Move a task between queue stat counters when its status changes,
-   * decrementing the previous bucket and incrementing the new one so the
-   * counters stay consistent (e.g. pending -> processing -> completed).
+   * Move a task between queue stat counters when its status changes.
    */
   private static async _transitionQueueStats(
     queueName: string,

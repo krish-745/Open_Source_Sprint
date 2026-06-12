@@ -2,6 +2,8 @@ import logger from '../utils/logger';
 import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
+import { getRedisClient } from './redis';
+import { deliverCallback } from './task-callbacks';
 import { TaskHooks } from './task-hooks';
 
 export interface TaskExecutionContext {
@@ -66,6 +68,21 @@ export class TaskExecutor {
         return;
       }
 
+      // If task is already completed/failed, skip processing to avoid straggler workers overriding state.
+      const currentTask = await TaskQueue.getTask(task.id);
+      if (currentTask && (currentTask.status === 'completed' || currentTask.status === 'failed')) {
+        logger.warn({ taskId: task.id, workerId }, 'Task already finished, skipping execution');
+        // Still need to decrement the worker's currentTasks counter.
+        await WorkerPool.completeTask(workerId, task.id, {
+          duration: Date.now() - startTime,
+          success: false,
+          retriesUsed: task.retries,
+          memory: 0,
+          cpu: 0,
+        });
+        return;
+      }
+
       // Validate handler exists
       const handler = this.handlers.get(task.handler);
       if (!handler) {
@@ -86,88 +103,223 @@ export class TaskExecutor {
       await WorkerPool.updateWorkerStatus(workerId, 'busy');
       await TaskHooks.emitTask('task.started', task);
 
-      // Execute with timeout, passing a cancellation-aware context.
-      const context: TaskExecutionContext = {
-        isCancelled: () => this.isCancelled(task.id),
-      };
-      const result = await Promise.race([
-        handler(task.payload, context),
-        new Promise<never>((_, reject) => {
-          timeoutHandle = setTimeout(() => {
-            reject(new Error(`Task execution timeout after ${task.timeout}ms`));
-          }, task.timeout);
-        }),
-      ]);
+      let executionResult: any;
+      let executionError: Error | undefined;
+
+      try {
+        // Execute with timeout, passing a cancellation-aware context.
+        const context: TaskExecutionContext = {
+          isCancelled: () => this.isCancelled(task.id),
+        };
+        executionResult = await Promise.race([
+          handler(task.payload, context),
+          new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(() => {
+              reject(new Error(`Task execution timeout after ${task.timeout}ms`));
+            }, task.timeout);
+          }),
+        ]);
+      } catch (err: any) {
+        executionError = err;
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      }
 
       // If the task was cancelled mid-flight, record it rather than completing.
       if (this.isCancelled(task.id)) {
         await TaskQueue.updateTaskStatus(task.id, 'cancelled');
         logger.info({ taskId: task.id }, 'Task cancelled during execution');
+        
+        await WorkerPool.completeTask(workerId, task.id, {
+          duration: Date.now() - startTime,
+          success: false,
+          retriesUsed: task.retries,
+          memory: 0,
+          cpu: 0,
+        });
         return;
       }
 
-      // Mark as completed
-      await TaskQueue.updateTaskStatus(task.id, 'completed', {
-        result,
-        completedAt: new Date(),
-      });
+      let shouldCompleteTask = true;
+      let finalResult = executionResult;
+      let finalStatus: TaskStatus = executionError ? 'failed' : 'completed';
+      let finalError: string | undefined = executionError ? (executionError.message || String(executionError)) : undefined;
 
-      const duration = Date.now() - startTime;
+      if (task.consensus && task.consensus.workers > 1) {
+        const client = getRedisClient();
+        shouldCompleteTask = false;
+        
+        // Save this worker's result or error
+        const resultObj = executionError ? { __consensus_error: finalError } : { __consensus_result: executionResult ?? null };
+        await client.hSet(`task:${task.id}:consensus`, workerId, JSON.stringify(resultObj));
+
+        const allResults = await client.hGetAll(`task:${task.id}:consensus`);
+        const resultCounts = new Map<string, number>();
+        let maxCount = 0;
+        let mostFrequentResult: string | null = null;
+        
+        for (const [wId, res] of Object.entries(allResults)) {
+          let weight = 1;
+          if (task.consensus.strategy === 'weighted') {
+            const workerObj = await WorkerPool.getWorker(wId);
+            if (workerObj) {
+              const weightTag = workerObj.tags.find(t => t.startsWith('weight:'));
+              if (weightTag) {
+                weight = Math.max(1, parseInt(weightTag.split(':')[1], 10) || 1);
+              }
+            }
+          }
+          
+          const count = (resultCounts.get(res) || 0) + weight;
+          resultCounts.set(res, count);
+          if (count > maxCount) {
+            maxCount = count;
+            mostFrequentResult = res;
+          }
+        }
+
+        const totalExpected = task.consensus.workers;
+        const totalSubmitted = Object.keys(allResults).length;
+        const strategy = task.consensus.strategy || 'majority';
+
+        if (strategy === 'all') {
+          if (totalSubmitted >= totalExpected) {
+             if (maxCount === totalExpected) {
+               shouldCompleteTask = true;
+             } else {
+               shouldCompleteTask = true;
+               mostFrequentResult = JSON.stringify({ __consensus_error: 'Consensus not reached: results did not match for all workers' });
+             }
+          }
+        } else if (strategy === 'majority') {
+          const majority = Math.floor(totalExpected / 2) + 1;
+          if (maxCount >= majority) {
+            shouldCompleteTask = true;
+          } else if (totalSubmitted >= totalExpected) {
+            shouldCompleteTask = true;
+            mostFrequentResult = JSON.stringify({ __consensus_error: 'Consensus not reached: no majority found' });
+          }
+        } else if (strategy === 'weighted') {
+           let totalWeight = 0;
+           for (const wId of Object.keys(allResults)) {
+             let w = 1;
+             const workerObj = await WorkerPool.getWorker(wId);
+             if (workerObj) {
+                const weightTag = workerObj.tags.find(t => t.startsWith('weight:'));
+                if (weightTag) w = Math.max(1, parseInt(weightTag.split(':')[1], 10) || 1);
+             }
+             totalWeight += w;
+           }
+           const majorityWeight = (totalWeight / 2);
+           if (maxCount > majorityWeight) {
+             shouldCompleteTask = true;
+           } else if (totalSubmitted >= totalExpected) {
+             shouldCompleteTask = true;
+             mostFrequentResult = JSON.stringify({ __consensus_error: 'Consensus not reached: no weighted majority found' });
+           }
+        }
+
+        if (shouldCompleteTask && mostFrequentResult) {
+           const parsed = JSON.parse(mostFrequentResult);
+           if (parsed.__consensus_error) {
+             finalStatus = 'failed';
+             finalError = parsed.__consensus_error;
+           } else {
+             finalStatus = 'completed';
+             finalResult = parsed.__consensus_result;
+             finalError = undefined;
+           }
+        }
+      }
+
+      const latestTask = await TaskQueue.getTask(task.id);
+      
+      if (shouldCompleteTask && latestTask && latestTask.status === 'processing') {
+        if (finalStatus === 'completed') {
+          await TaskQueue.updateTaskStatus(task.id, 'completed', {
+            result: finalResult,
+            completedAt: new Date(),
+          });
+          await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result: finalResult });
+          if (task.callbackUrl) {
+            await deliverCallback({ ...task, status: 'completed', completedAt: new Date() }, finalResult);
+          }
+          logger.info({ taskId: task.id, duration: Date.now() - startTime }, 'Task completed successfully');
+        } else {
+          // Non-consensus task failed: attempt retry; exhaust retries → DLQ.
+          if (!task.consensus) {
+             const retried = await TaskQueue.retryTask(task.id);
+             await TaskHooks.emitTask(retried ? 'task.retried' : 'task.failed', {
+                ...task,
+                status: retried ? 'retry' : 'failed',
+                error: finalError,
+             });
+             if (!retried) {
+                await TaskQueue.updateTaskStatus(task.id, 'failed', {
+                  error: finalError,
+                  completedAt: new Date(),
+                });
+             }
+          } else {
+             // Consensus evaluation failed
+             await TaskQueue.updateTaskStatus(task.id, 'failed', {
+               error: finalError,
+               completedAt: new Date(),
+             });
+             await TaskHooks.emitTask('task.failed', {
+                ...task,
+                status: 'failed',
+                error: finalError,
+             });
+          }
+          logger.error({ taskId: task.id, error: finalError, duration: Date.now() - startTime }, 'Task execution failed');
+        }
+      } else if (!shouldCompleteTask && executionError && !task.consensus) {
+        logger.error({ taskId: task.id, error: finalError }, 'Unexpected state: handler errored without consensus');
+      }
+
       await WorkerPool.completeTask(workerId, task.id, {
-        duration,
-        success: true,
+        duration: Date.now() - startTime,
+        success: finalStatus === 'completed',
         retriesUsed: task.retries,
         memory: 0,
         cpu: 0,
       });
 
-      await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result });
 
-      logger.info({ taskId: task.id, duration }, 'Task completed successfully');
     } catch (error: any) {
       const duration = Date.now() - startTime;
       const errorMessage = error?.message || String(error);
+      logger.error({ taskId: task.id, error: errorMessage, duration }, 'Task execution crashed unexpectedly');
 
-      logger.error({ taskId: task.id, error: errorMessage, duration }, 'Task execution failed');
-
-      // Attempt retry
-      const retried = await TaskQueue.retryTask(task.id);
-      await TaskHooks.emitTask(retried ? 'task.retried' : 'task.failed', {
-        ...task,
-        status: retried ? 'retry' : 'failed',
-        error: errorMessage,
-      });
-
-      if (retried) {
-        await WorkerPool.completeTask(workerId, task.id, {
-          duration,
-          success: false,
-          retriesUsed: task.retries,
-          memory: 0,
-          cpu: 0,
-        });
-      } else {
-        // Move to dead letter queue
-        await TaskQueue.updateTaskStatus(task.id, 'failed', {
+      // Attempt to retry the task; if retries are exhausted move it to DLQ.
+      try {
+        const retried = await TaskQueue.retryTask(task.id);
+        await TaskHooks.emitTask(retried ? 'task.retried' : 'task.failed', {
+          ...task,
+          status: retried ? 'retry' : 'failed',
           error: errorMessage,
-          completedAt: new Date(),
         });
-
-        await WorkerPool.completeTask(workerId, task.id, {
-          duration,
-          success: false,
-          retriesUsed: task.retries,
-          memory: 0,
-          cpu: 0,
-        });
+        if (!retried) {
+          await TaskQueue.updateTaskStatus(task.id, 'failed', {
+            error: errorMessage,
+            completedAt: new Date(),
+          });
+        }
+      } catch {
+        // If the task can't be found (e.g. it was already removed), just log.
+        logger.warn({ taskId: task.id }, 'Could not retry/fail task after crash');
       }
-    } finally {
-      if (timeoutHandle) clearTimeout(timeoutHandle);
-      this.clearCancellation(task.id);
 
-      // Reflect the worker's actual state: it is only idle once it has no
-      // remaining tasks. With concurrent execution, other tasks may still be
-      // running when this one finishes, so the worker should stay busy.
+      await WorkerPool.completeTask(workerId, task.id, {
+        duration,
+        success: false,
+        retriesUsed: task.retries,
+        memory: 0,
+        cpu: 0,
+      });
+    } finally {
+      this.clearCancellation(task.id);
       const worker = await WorkerPool.getWorker(workerId);
       if (worker) {
         await WorkerPool.updateWorkerStatus(workerId, worker.currentTasks > 0 ? 'busy' : 'idle');
@@ -216,15 +368,5 @@ export class TaskExecutor {
    */
   static clearHandlers(): void {
     this.handlers.clear();
-  }
-
-  // Private helper methods
-
-  private static _timeoutPromise(timeoutMs: number): Promise<never> {
-    return new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new Error(`Task execution timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-    });
   }
 }
