@@ -43,6 +43,9 @@ function makeClient(taskJson: string | null, execImpl: jest.Mock) {
   const client: any = {
     watch: jest.fn().mockResolvedValue('OK'),
     unwatch: jest.fn().mockResolvedValue('OK'),
+    executeIsolated: jest.fn().mockImplementation(async (callback) => {
+      return callback(client);
+    }),
     get: jest.fn().mockResolvedValue(taskJson),
     multi: jest.fn().mockReturnValue(multi),
     hIncrBy: jest.fn().mockResolvedValue(1),

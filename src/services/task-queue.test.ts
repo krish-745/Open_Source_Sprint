@@ -33,7 +33,7 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
   it('decrements the previous bucket and increments the new one on transition', async () => {
     const task = buildTask({ status: 'pending', queue: 'default' });
     const hIncrBy = jest.fn().mockResolvedValue(1);
-    const mockClient = {
+    const mockClient: any = {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
       watch: jest.fn().mockResolvedValue('OK'),
@@ -44,7 +44,8 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       }),
       hIncrBy,
     };
-    mockedGetRedisClient.mockReturnValue(mockClient as any);
+    mockClient.executeIsolated = jest.fn(async (cb: any) => cb(mockClient));
+    mockedGetRedisClient.mockReturnValue(mockClient);
 
     await TaskQueue.updateTaskStatus('task-1', 'processing');
 
@@ -55,7 +56,7 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
   it('only decrements pending when moving to an untracked status (queued)', async () => {
     const task = buildTask({ status: 'pending', queue: 'default' });
     const hIncrBy = jest.fn().mockResolvedValue(1);
-    const mockClient = {
+    const mockClient: any = {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
       watch: jest.fn().mockResolvedValue('OK'),
@@ -66,7 +67,8 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       }),
       hIncrBy,
     };
-    mockedGetRedisClient.mockReturnValue(mockClient as any);
+    mockClient.executeIsolated = jest.fn(async (cb: any) => cb(mockClient));
+    mockedGetRedisClient.mockReturnValue(mockClient);
 
     await TaskQueue.updateTaskStatus('task-1', 'queued');
 
@@ -77,7 +79,7 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
   it('does not touch stats when the status is unchanged', async () => {
     const task = buildTask({ status: 'processing', queue: 'default' });
     const hIncrBy = jest.fn().mockResolvedValue(1);
-    const mockClient = {
+    const mockClient: any = {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
       watch: jest.fn().mockResolvedValue('OK'),
@@ -88,7 +90,8 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
       }),
       hIncrBy,
     };
-    mockedGetRedisClient.mockReturnValue(mockClient as any);
+    mockClient.executeIsolated = jest.fn(async (cb: any) => cb(mockClient));
+    mockedGetRedisClient.mockReturnValue(mockClient);
 
     await TaskQueue.updateTaskStatus('task-1', 'processing');
 

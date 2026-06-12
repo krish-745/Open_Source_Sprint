@@ -43,6 +43,16 @@ export class QueueFullError extends Error {
   }
 }
 
+/**
+ * Thrown when a task's cost exceeds the caller's available budget.
+ */
+export class BudgetExceededError extends Error {
+  constructor(callerId: string, available: number, required: number) {
+    super(`Budget exceeded for caller ${callerId}: available ${available}, required ${required}`);
+    this.name = 'BudgetExceededError';
+  }
+}
+
 export class TaskQueue {
   /**
    * Create a new task and add it to the queue.
@@ -90,6 +100,19 @@ export class TaskQueue {
       throw new QueueFullError(queueName, maxQueueSize);
     }
 
+    // Use ?? (not ||) so that an explicit cost of 0 is honoured as a free task.
+    // Clamp to >= 0 and fall back to 1 for non-finite/NaN values so invalid
+    // metadata never corrupts budget arithmetic.
+    const rawCost = options.metadata?.cost ?? 1;
+    const cost = Number.isFinite(rawCost) && rawCost >= 0 ? rawCost : 1;
+    const callerId = options.metadata?.callerId;
+
+    if (callerId) {
+      const budget = await this.getCallerBudget(callerId);
+      if (budget !== null && budget < cost) {
+        throw new BudgetExceededError(callerId, budget, cost);
+      }
+    }
     const task: Task = {
       id: taskId,
       name,
@@ -142,6 +165,15 @@ export class TaskQueue {
 
     // Update queue metadata
     await this._updateQueueStats(queueName, 1);
+
+    // Deduct caller budget only after the task is fully persisted, so a
+    // write failure never silently drains budget without creating the task.
+    if (callerId) {
+      const budget = await this.getCallerBudget(callerId);
+      if (budget !== null) {
+        await client.hIncrBy('caller:budgets', callerId, -cost);
+      }
+    }
 
     logger.info({ taskId, queueName }, 'Task created');
     return task;
@@ -290,50 +322,55 @@ export class TaskQueue {
     const maxAttempts = 5;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await client.watch(key);
-
-      const data = await client.get(key);
-      if (!data) {
-        await client.unwatch();
-        throw new Error(`Task ${taskId} not found`);
-      }
-
-      const task: Task = JSON.parse(data);
-      const previousStatus = task.status;
-
-      task.status = status;
-      if (metadata) {
-        Object.assign(task, metadata);
-      }
-      if (status === 'completed') {
-        task.completedAt = new Date();
-      } else if (status === 'processing') {
-        task.startedAt = new Date();
-      }
-
       try {
-        const timestamp = new Date(task.createdAt).getTime();
-        const multi = client.multi().set(key, JSON.stringify(task));
+        await client.executeIsolated(async (isolatedClient) => {
+          await isolatedClient.watch(key);
 
-        // Incorporate index updates directly into the optimistic locking transaction
-        if (previousStatus !== status) {
-          multi.zRem(`${TASK_STATUS_INDEX_PREFIX}${previousStatus}`, taskId);
-          multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${previousStatus}`, taskId);
-          multi.zAdd(`${TASK_STATUS_INDEX_PREFIX}${status}`, { score: timestamp, value: taskId });
-          multi.zAdd(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${status}`, { score: timestamp, value: taskId });
-        }
+          const data = await isolatedClient.get(key);
+          if (!data) {
+            await isolatedClient.unwatch();
+            throw new Error(`Task ${taskId} not found`);
+          }
 
-        await multi.exec();
+          const task: Task = JSON.parse(data);
+          const previousStatus = task.status;
 
-        // Keep queue stats consistent as the task moves between states.
-        if (previousStatus !== status) {
-          await this._transitionQueueStats(task.queue, previousStatus, status);
-        }
+          task.status = status;
+          if (metadata) {
+            Object.assign(task, metadata);
+          }
+          if (status === 'completed') {
+            task.completedAt = new Date();
+          } else if (status === 'processing') {
+            task.startedAt = new Date();
+          }
+
+          const timestamp = new Date(task.createdAt).getTime();
+          const multi = isolatedClient.multi().set(key, JSON.stringify(task));
+
+          // Incorporate index updates directly into the optimistic locking transaction
+          if (previousStatus !== status) {
+            multi.zRem(`${TASK_STATUS_INDEX_PREFIX}${previousStatus}`, taskId);
+            multi.zRem(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${previousStatus}`, taskId);
+            multi.zAdd(`${TASK_STATUS_INDEX_PREFIX}${status}`, { score: timestamp, value: taskId });
+            multi.zAdd(`${TASK_QUEUE_STATUS_INDEX_PREFIX}${task.queue}:status:${status}`, { score: timestamp, value: taskId });
+          }
+
+          const replies = await multi.exec();
+          if (replies === null) {
+            throw new WatchError();
+          }
+
+          // Keep queue stats consistent as the task moves between states.
+          if (previousStatus !== status) {
+            await this._transitionQueueStats(task.queue, previousStatus, status);
+          }
+        });
 
         logger.info({ taskId, status }, 'Task status updated');
         return;
       } catch (error) {
-        if (error instanceof WatchError) {
+        if (error instanceof WatchError || (error as Error).message.includes('watched keys has been changed')) {
           logger.warn({ taskId, attempt }, 'Concurrent task update detected, retrying');
           continue;
         }
@@ -878,20 +915,62 @@ export class TaskQueue {
     return recovered;
   }
 
+  /**
+   * Set budget for a caller
+   */
+  static async setCallerBudget(callerId: string, budget: number): Promise<void> {
+    const client = getRedisClient();
+    await client.hSet('caller:budgets', callerId, budget.toString());
+  }
+
+  /**
+   * Get budget for a caller
+   */
+  static async getCallerBudget(callerId: string): Promise<number | null> {
+    const client = getRedisClient();
+    const val = await client.hGet('caller:budgets', callerId);
+    return val ? parseInt(val, 10) : null;
+  }
+
+  /**
+   * Predict the total cost of all pending tasks in a queue
+   */
+  static async predictQueueCost(queueName: string): Promise<{ totalCost: number, taskCount: number }> {
+    const client = getRedisClient();
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const taskIds = await client.zRange(queueKey, 0, -1);
+    
+    if (taskIds.length === 0) return { totalCost: 0, taskCount: 0 };
+
+    let totalCost = 0;
+    for (const id of taskIds) {
+      const data = await client.get(`${TASK_PREFIX}${id}`);
+      if (data) {
+        const t: Task = JSON.parse(data);
+        const rawCost = t.metadata?.cost ?? 1;
+        const cost = Number.isFinite(rawCost) && rawCost >= 0 ? rawCost : 1;
+        totalCost += cost;
+      }
+    }
+    return { totalCost, taskCount: taskIds.length };
+  }
+
   // --- Private helper methods ---
 
   /**
    * Batch resolves an array of IDs into full Task objects efficiently
    */
   private static async _fetchTasksByIds(taskIds: string[]): Promise<Task[]> {
-    if (taskIds.length === 0) return [];
+    if (!taskIds.length) return [];
     const client = getRedisClient();
     const keys = taskIds.map(id => `${TASK_PREFIX}${id}`);
-    const dataList = await client.mGet(keys);
-
-    return dataList
+    
+    // Use mGet to fetch all task payloads in one round-trip
+    const payloads = await client.mGet(keys);
+    
+    return payloads
       .filter((data): data is string => data !== null)
-      .map((data) => JSON.parse(data));
+      .map(data => JSON.parse(data) as Task);
   }
 
   /**
@@ -901,8 +980,8 @@ export class TaskQueue {
     taskId: string,
     queueName: string,
     timestamp: number,
-    newStatus: string,
-    oldStatus?: string
+    newStatus: Task['status'],
+    oldStatus?: Task['status']
   ): Promise<void> {
     const client = getRedisClient();
     const multi = client.multi();
