@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
+import { TaskQueue } from './task-queue';
 import { Worker, WorkerStatus, Task, TaskExecutionMetrics } from '../types';
 
 const WORKER_PREFIX = 'worker:';
@@ -213,14 +214,45 @@ export class WorkerPool {
     for (const workerId of allWorkers) {
       const worker = await this.getWorker(workerId);
       if (worker && now - new Date(worker.lastHeartbeat).getTime() > timeout) {
-        worker.status = 'offline';
-        await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+        // Mark offline and reassign any tasks the worker was processing.
+        await this.handleWorkerDisconnect(workerId);
         staleCount++;
-        logger.warn({ workerId }, 'Worker marked as offline');
       }
     }
 
     return staleCount;
+  }
+
+  /**
+   * Handle a worker disconnecting (crash or missed heartbeats): requeue any
+   * tasks it was processing so other workers can pick them up, clear its task
+   * assignment and counters, and mark it offline. Returns the number of tasks
+   * reassigned.
+   */
+  static async handleWorkerDisconnect(workerId: string): Promise<number> {
+    const client = getRedisClient();
+    const taskListKey = `worker:${workerId}:tasks`;
+
+    const taskIds = await client.lRange(taskListKey, 0, -1);
+    let reassigned = 0;
+    for (const taskId of taskIds) {
+      const requeued = await TaskQueue.requeueTask(taskId);
+      if (requeued) {
+        reassigned++;
+      }
+    }
+    await client.del(taskListKey);
+
+    const worker = await this.getWorker(workerId);
+    if (worker) {
+      worker.status = 'offline';
+      worker.currentTasks = 0;
+      worker.capacity = 0;
+      await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+    }
+
+    logger.warn({ workerId, reassigned }, 'Worker disconnected; tasks reassigned and worker marked offline');
+    return reassigned;
   }
 
   /**
