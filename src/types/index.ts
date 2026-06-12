@@ -23,9 +23,22 @@ export interface Task {
   queue: string;
   dependencies: string[]; // Task IDs this task depends on
   scheduledFor?: Date; // For delayed tasks
+  callbackUrl?: string; // Optional webhook to POST the result to on completion
+  branches?: TaskBranch[]; // Conditional next-steps evaluated against the result
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
+}
+
+/**
+ * A conditional branch: if the task result matches `condition`, the referenced
+ * next task/template should run. `condition` is matched against the stringified
+ * result; prefix it with `regex:` to match with a regular expression.
+ */
+export interface TaskBranch {
+  condition: string;
+  nextTaskId?: string;
+  nextTemplate?: string;
 }
 
 export type TaskStatus =
