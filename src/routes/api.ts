@@ -43,7 +43,7 @@ router.get('/templates', (_req: Request, res: Response) => {
 
 router.post('/tasks', async (req: Request, res: Response) => {
   try {
-    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, templateName } = req.body;
+   const { name, handler, payload, queueName, priority, maxRetries, timeout, ttl, tags, templateName } = req.body;
 
     // If a template is named, apply it for the handler/payload/priority.
     let effectiveHandler = handler;
@@ -73,6 +73,7 @@ router.post('/tasks', async (req: Request, res: Response) => {
       priority: effectivePriority,
       maxRetries,
       timeout,
+      ttl,
       tags,
     });
 
@@ -122,6 +123,7 @@ router.post('/tasks/batch', async (req: Request, res: Response) => {
           priority: t.priority,
           maxRetries: t.maxRetries,
           timeout: t.timeout,
+          ttl: t.ttl,
           tags: t.tags,
         },
       }))

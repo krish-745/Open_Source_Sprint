@@ -13,6 +13,8 @@ export interface Task {
   retries: number;
   maxRetries: number;
   timeout: number; // in milliseconds
+  ttl?: number;
+  expiresAt?: Date;
   createdAt: Date;
   startedAt?: Date;
   completedAt?: Date;

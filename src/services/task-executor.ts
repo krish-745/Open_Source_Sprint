@@ -57,6 +57,18 @@ export class TaskExecutor {
         logger.info({ taskId: task.id }, 'Task cancelled before execution');
         return;
       }
+      
+      // Prevent execution of expired tasks
+      if (task.expiresAt && new Date(task.expiresAt).getTime() <= Date.now()) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled', {
+          error: 'Task expired before execution',
+          completedAt: new Date(),
+        });
+
+        logger.warn({ taskId: task.id }, 'Expired task execution prevented');
+        return;
+      }
+
 
       // Validate handler exists
       const handler = this.handlers.get(task.handler);

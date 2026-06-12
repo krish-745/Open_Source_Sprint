@@ -11,6 +11,12 @@ const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
 const TASK_STATUS_INDEX_PREFIX = 'tasks:status:';
 const TASK_QUEUE_STATUS_INDEX_PREFIX = 'tasks:queue:';
+const DEFAULT_TTL_BY_PRIORITY: Record<Task['priority'], number> = {
+  critical: 3600,
+  high: 1800,
+  medium: 900,
+  low: 300,
+};
 
 /**
  * Thrown when a task's dependencies would introduce a circular dependency.
@@ -48,6 +54,7 @@ export class TaskQueue {
       priority?: 'low' | 'medium' | 'high' | 'critical';
       maxRetries?: number;
       timeout?: number;
+      ttl?: number;
       dependencies?: string[];
       scheduledFor?: Date;
       callbackUrl?: string;
@@ -75,17 +82,22 @@ export class TaskQueue {
     }
     
     const createdAt = new Date();
+    const priority = options.priority || 'medium';
+    const ttl = options.ttl ?? DEFAULT_TTL_BY_PRIORITY[priority];
+    const expiresAt = new Date(createdAt.getTime() + ttl * 1000);
     const task: Task = {
       id: taskId,
       name,
       description: `Task: ${name}`,
-      priority: options.priority || 'medium',
+      priority,
       status: 'pending',
       handler,
       payload: finalPayload,
       retries: 0,
       maxRetries: options.maxRetries || 3,
       timeout: options.timeout || 30000,
+      ttl,
+      expiresAt,
       createdAt,
       queue: queueName,
       dependencies: options.dependencies || [],
@@ -345,6 +357,10 @@ export class TaskQueue {
         const task = await this.getTask(taskId);
         if (!task) continue;
 
+        if (this._isTaskExpired(task)) {
+          await this._cancelExpiredTask(task);
+          continue;
+        }
         if (task.dependencies.length > 0) {
           const depsResolved = await this._checkDependencies(task.dependencies);
           if (!depsResolved) continue;
@@ -387,6 +403,11 @@ export class TaskQueue {
 
         const task = await this.getTask(taskId);
         if (!task) continue;
+
+        if (this._isTaskExpired(task)) {
+          await this._cancelExpiredTask(task);
+          continue;
+        }
 
         if (task.dependencies.length > 0) {
           const depsResolved = await this._checkDependencies(task.dependencies);
@@ -483,6 +504,7 @@ export class TaskQueue {
    * Get all tasks from queue
    */
   static async getQueueTasks(queueName: string, limit: number = 100, offset: number = 0): Promise<Task[]> {
+    await this._expireTasksInQueue(queueName);
     const client = getRedisClient();
     const queueKey = `${QUEUE_PREFIX}${queueName}`;
 
@@ -540,6 +562,8 @@ export class TaskQueue {
       processing: parseInt(stats.processing || '0'),
       completed: parseInt(stats.completed || '0'),
       failed: parseInt(stats.failed || '0'),
+      cancelled: parseInt(stats.cancelled || '0'),
+      expired: parseInt(stats.expired || '0'),
     };
   }
 
@@ -659,6 +683,63 @@ export class TaskQueue {
   }
 
   // --- Private helper methods ---
+  private static _isTaskExpired(task: Task): boolean {
+    if (!task.expiresAt) {
+      return false;
+    }
+
+    if (!['pending', 'queued', 'retry', 'blocked'].includes(task.status)) {
+      return false;
+    }
+
+    return new Date(task.expiresAt).getTime() <= Date.now();
+  }
+  
+  private static async _cancelExpiredTask(task: Task): Promise<void> {
+    const client = getRedisClient();
+    const previousStatus = task.status;
+
+    task.status = 'cancelled';
+    task.error = 'Task expired before being picked up';
+    task.completedAt = new Date();
+
+    await client.set(`${TASK_PREFIX}${task.id}`, JSON.stringify(task));
+    await client.zRem(`${QUEUE_PREFIX}${task.queue}`, task.id);
+
+    await this._updateTaskIndices(
+      task.id,
+      task.queue,
+      new Date(task.createdAt).getTime(),
+      task.status,
+      previousStatus
+    );
+
+    await this._transitionQueueStats(task.queue, previousStatus, task.status);
+
+    const statsKey = `${QUEUE_PREFIX}${task.queue}:stats`;
+    await client.hIncrBy(statsKey, 'expired', 1);
+
+    logger.warn({ taskId: task.id }, 'Task expired and cancelled');
+  }
+
+  private static async _expireTasksInQueue(queueName: string): Promise<number> {
+    const client = getRedisClient();
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const taskIds = await client.zRange(queueKey, 0, -1);
+
+    let expired = 0;
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+
+      if (task && this._isTaskExpired(task)) {
+        await this._cancelExpiredTask(task);
+        expired++;
+      }
+    }
+
+    return expired;
+  }
 
   /**
    * Batch resolves an array of IDs into full Task objects efficiently
@@ -803,9 +884,11 @@ export class TaskQueue {
   // Task statuses that are tracked as queue stat counters.
   private static readonly STATS_BUCKETS: ReadonlyArray<TaskStatus> = [
     'pending',
+    'queued',
     'processing',
     'completed',
     'failed',
+    'cancelled',
   ];
 
   /**
