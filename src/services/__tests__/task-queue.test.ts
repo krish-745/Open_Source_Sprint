@@ -728,7 +728,6 @@ describe('TaskQueue Tests', () => {
       expect(savedTask.status).toBe('queued');
       expect(savedTask.workerId).toBeUndefined();
       expect(mockRedisClient.zAdd).toHaveBeenCalledWith('queue:default', expect.any(Object));
-    });
-  });
+        });
   });
 });
