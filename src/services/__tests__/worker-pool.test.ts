@@ -85,6 +85,10 @@ function makeFakeRedis() {
       _hash(k).set(field, next.toString());
       return next;
     }),
+    lRange: jest.fn(async (k: string, start: number, stop: number) => {
+      const l = lists.get(k) ?? [];
+      return stop === -1 ? l.slice(start) : l.slice(start, stop + 1);
+    }),
     __strings: strings,
   } as any;
 }

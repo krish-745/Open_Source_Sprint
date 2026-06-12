@@ -100,3 +100,111 @@ export async function withRedisRetry<T>(
 
   throw lastError;
 }
+
+export interface PoolStats {
+  total: number;
+  inUse: number;
+  idle: number;
+  waiting: number;
+  max: number;
+  utilization: number; // 0-1, inUse / max
+}
+
+/**
+ * A simple Redis connection pool with configurable min/max size.
+ *
+ * Connections are created lazily up to `max`. When all connections are in use,
+ * `acquire()` requests are queued and resolved as connections are released, so
+ * callers never exceed the connection limit under load. Use `withConnection()`
+ * to run an operation with automatic acquire/release.
+ */
+export class RedisConnectionPool {
+  private idle: RedisClientType[] = [];
+  private inUse = new Set<RedisClientType>();
+  private waiters: Array<(client: RedisClientType) => void> = [];
+  private total = 0;
+
+  constructor(
+    private readonly factory: () => Promise<RedisClientType>,
+    private readonly min = 2,
+    private readonly max = 10
+  ) {
+    if (min < 0 || max < 1 || min > max) {
+      throw new Error('Invalid pool size: require 0 <= min <= max and max >= 1');
+    }
+  }
+
+  /** Pre-create the minimum number of connections. */
+  async warmUp(): Promise<void> {
+    while (this.total < this.min) {
+      const client = await this.factory();
+      this.total++;
+      this.idle.push(client);
+    }
+  }
+
+  /** Acquire a connection, creating one if under `max`, otherwise queueing. */
+  async acquire(): Promise<RedisClientType> {
+    const existing = this.idle.pop();
+    if (existing) {
+      this.inUse.add(existing);
+      return existing;
+    }
+
+    if (this.total < this.max) {
+      this.total++;
+      const client = await this.factory();
+      this.inUse.add(client);
+      return client;
+    }
+
+    return new Promise<RedisClientType>((resolve) => {
+      this.waiters.push((client) => {
+        this.inUse.add(client);
+        resolve(client);
+      });
+    });
+  }
+
+  /** Return a connection to the pool, handing it to any waiting caller. */
+  release(client: RedisClientType): void {
+    this.inUse.delete(client);
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter(client);
+    } else {
+      this.idle.push(client);
+    }
+  }
+
+  /** Run an operation with a pooled connection, releasing it afterwards. */
+  async withConnection<T>(fn: (client: RedisClientType) => Promise<T>): Promise<T> {
+    const client = await this.acquire();
+    try {
+      return await fn(client);
+    } finally {
+      this.release(client);
+    }
+  }
+
+  /** Current pool utilization for monitoring. */
+  getStats(): PoolStats {
+    return {
+      total: this.total,
+      inUse: this.inUse.size,
+      idle: this.idle.length,
+      waiting: this.waiters.length,
+      max: this.max,
+      utilization: this.max > 0 ? this.inUse.size / this.max : 0,
+    };
+  }
+
+  /** Close all connections in the pool. */
+  async drain(): Promise<void> {
+    const all = [...this.idle, ...this.inUse];
+    this.idle = [];
+    this.inUse.clear();
+    this.total = 0;
+    await Promise.all(all.map((c) => c.quit().catch(() => undefined)));
+  }
+}

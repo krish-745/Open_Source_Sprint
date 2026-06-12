@@ -36,6 +36,12 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
     const mockClient = {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
+      watch: jest.fn().mockResolvedValue('OK'),
+      unwatch: jest.fn().mockResolvedValue('OK'),
+      multi: jest.fn(() => {
+        const m: any = { set: () => m, zAdd: () => m, zRem: () => m, exec: () => Promise.resolve([]) };
+        return m;
+      }),
       hIncrBy,
     };
     mockedGetRedisClient.mockReturnValue(mockClient as any);
@@ -52,6 +58,12 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
     const mockClient = {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
+      watch: jest.fn().mockResolvedValue('OK'),
+      unwatch: jest.fn().mockResolvedValue('OK'),
+      multi: jest.fn(() => {
+        const m: any = { set: () => m, zAdd: () => m, zRem: () => m, exec: () => Promise.resolve([]) };
+        return m;
+      }),
       hIncrBy,
     };
     mockedGetRedisClient.mockReturnValue(mockClient as any);
@@ -68,6 +80,12 @@ describe('TaskQueue.updateTaskStatus queue stats', () => {
     const mockClient = {
       get: jest.fn().mockResolvedValue(JSON.stringify(task)),
       set: jest.fn().mockResolvedValue('OK'),
+      watch: jest.fn().mockResolvedValue('OK'),
+      unwatch: jest.fn().mockResolvedValue('OK'),
+      multi: jest.fn(() => {
+        const m: any = { set: () => m, zAdd: () => m, zRem: () => m, exec: () => Promise.resolve([]) };
+        return m;
+      }),
       hIncrBy,
     };
     mockedGetRedisClient.mockReturnValue(mockClient as any);

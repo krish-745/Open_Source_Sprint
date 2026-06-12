@@ -39,13 +39,15 @@ describe('TaskQueue.getNextTask priority handling', () => {
     const client: any = {
       zRange: jest.fn().mockResolvedValue(['high', 'low']),
       get: jest.fn((k: string) => Promise.resolve(store[k] ?? null)),
+      zRem: jest.fn().mockResolvedValue(1),
+      mGet: jest.fn().mockResolvedValue([]),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
     const next = await TaskQueue.getNextTask('default');
     expect(next?.id).toBe('high');
-    // Whole queue scanned, not just a fixed window.
-    expect(client.zRange).toHaveBeenCalledWith('queue:default', 0, -1, { REV: true });
+    // First chunk queried.
+    expect(client.zRange).toHaveBeenCalledWith('queue:default', 0, 49, { REV: true });
   });
 
   it('does not skip a runnable high-priority task when many higher-sorted tasks are blocked', async () => {
@@ -65,6 +67,8 @@ describe('TaskQueue.getNextTask priority handling', () => {
     const client: any = {
       zRange: jest.fn().mockResolvedValue(ids),
       get: jest.fn((k: string) => Promise.resolve(store[k] ?? null)),
+      zRem: jest.fn().mockResolvedValue(1),
+      mGet: jest.fn().mockImplementation(async (keys: string[]) => keys.map((k: string) => store[k] || null)),
     };
     mockedGetRedisClient.mockReturnValue(client);
 

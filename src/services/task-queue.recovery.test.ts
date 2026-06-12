@@ -57,6 +57,15 @@ describe('TaskQueue.recoverStaleTasks', () => {
         return Promise.resolve('OK');
       }),
       zAdd: jest.fn().mockResolvedValue(1),
+      hDel: jest.fn().mockResolvedValue(1),
+      multi: jest.fn().mockImplementation(() => {
+        const m: any = {
+          zRem: jest.fn().mockReturnThis(),
+          zAdd: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([['OK']]),
+        };
+        return m;
+      }),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
@@ -79,6 +88,15 @@ describe('TaskQueue.recoverStaleTasks', () => {
       get: jest.fn().mockResolvedValue(JSON.stringify(fresh)),
       set: jest.fn(),
       zAdd: jest.fn(),
+      hDel: jest.fn(),
+      multi: jest.fn().mockImplementation(() => {
+        const m: any = {
+          zRem: jest.fn().mockReturnThis(),
+          zAdd: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([['OK']]),
+        };
+        return m;
+      }),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
