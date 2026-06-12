@@ -571,6 +571,52 @@ export class TaskQueue {
   }
 
   /**
+   * Search tasks by name and description.
+   * Compares the search term case-insensitively using simple string inclusion to handle special characters safely.
+   * Returns matching task IDs along with a relevance score (exact name match = 10, partial name match = 5, description match = 2).
+   */
+  static async searchTasks(
+    searchTerm: string,
+    limit: number = 50
+  ): Promise<{ taskId: string; score: number }[]> {
+    const client = getRedisClient();
+    const taskIds = await client.zRange(TASK_INDEX_KEY, 0, -1);
+    
+    const results: { taskId: string; score: number }[] = [];
+    const term = searchTerm.toLowerCase().trim();
+    if (!term) return [];
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (!task) continue;
+
+      const name = (task.name || '').toLowerCase();
+      const description = (task.description || '').toLowerCase();
+
+      let score = 0;
+
+      // Check name match
+      if (name === term) {
+        score += 10;
+      } else if (name.includes(term)) {
+        score += 5;
+      }
+
+      // Check description match
+      if (description.includes(term)) {
+        score += 2;
+      }
+
+      if (score > 0) {
+        results.push({ taskId, score });
+      }
+    }
+
+    // Sort by relevance score (highest first)
+    results.sort((a, b) => b.score - a.score);
+
+    // Limit results to prevent performance issues
+    return results.slice(0, limit);
    * Put a task back on its queue for another worker to pick up.
    */
   static async requeueTask(taskId: string): Promise<boolean> {

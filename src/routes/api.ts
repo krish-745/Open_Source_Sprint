@@ -94,6 +94,22 @@ router.post('/tasks', async (req: Request, res: Response) => {
   }
 });
 
+router.get('/tasks/search', async (req: Request, res: Response) => {
+  try {
+    const { q, limit = '50' } = req.query;
+
+    if (!q || typeof q !== 'string') {
+      return res.status(400).json({ error: 'Query parameter q is required and must be a string' });
+    }
+
+    const results = await TaskQueue.searchTasks(q, parseInt(limit as string));
+    res.json(results);
+  } catch (error: any) {
+    logger.error({ error }, 'Search tasks error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.post('/tasks/batch', async (req: Request, res: Response) => {
   try {
     const { tasks } = req.body;
