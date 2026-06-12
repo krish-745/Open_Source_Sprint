@@ -24,6 +24,10 @@ export interface Task {
   scheduledFor?: Date; // For delayed tasks
   callbackUrl?: string; // Optional webhook to POST the result to on completion
   branches?: TaskBranch[]; // Conditional next-steps evaluated against the result
+  quorum?: {
+    count: number;
+    strategy: 'all' | 'majority' | 'weighted';
+  };
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;

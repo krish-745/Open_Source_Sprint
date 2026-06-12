@@ -14,11 +14,14 @@ const mockRedisClient = {
         store[key] = value;
         return m;
       }),
+      zAdd: jest.fn().mockReturnThis(),
+      zRem: jest.fn().mockReturnThis(),
       exec: jest.fn().mockResolvedValue([['OK']]),
     };
     return m;
   }),
   get: jest.fn().mockImplementation(async (key: string) => store[key] || null),
+  mGet: jest.fn().mockImplementation(async (keys: string[]) => keys.map((k) => store[k] || null)),
   set: jest.fn().mockImplementation(async (key: string, value: string) => {
     store[key] = value;
     return 'OK';

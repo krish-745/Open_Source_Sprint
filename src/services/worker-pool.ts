@@ -145,6 +145,29 @@ export class WorkerPool {
   }
 
   /**
+   * Assign task to multiple workers
+   */
+  static async assignTaskToMultiple(workerIds: string[], task: Task): Promise<void> {
+    const client = getRedisClient();
+
+    for (const workerId of workerIds) {
+      const worker = await this.getWorker(workerId);
+      if (!worker) {
+        logger.warn({ workerId }, `Worker ${workerId} not found during multi-assignment`);
+        continue;
+      }
+
+      worker.currentTasks++;
+      worker.capacity = Math.round((worker.currentTasks / worker.maxConcurrent) * 100);
+
+      await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+      await client.lPush(`worker:${workerId}:tasks`, task.id);
+      
+      logger.info({ workerId, taskId: task.id }, 'Task assigned to worker (quorum)');
+    }
+  }
+
+  /**
    * Complete task on worker
    */
   static async completeTask(

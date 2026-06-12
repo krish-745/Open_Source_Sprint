@@ -173,6 +173,179 @@ export class TaskExecutor {
   }
 
   /**
+   * Execute a task with Multi-Quorum Consensus
+   */
+  static async executeWithConsensus(workerIds: string[], task: Task): Promise<void> {
+    const startTime = Date.now();
+    let timeoutHandle: NodeJS.Timeout | undefined;
+
+    try {
+      if (this.isCancelled(task.id)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled');
+        logger.info({ taskId: task.id }, 'Task cancelled before execution');
+        return;
+      }
+
+      const handler = this.handlers.get(task.handler);
+      if (!handler) {
+        throw new Error(`No handler registered for: ${task.handler}`);
+      }
+      if (task.timeout <= 0) {
+        throw new Error('Task timeout must be positive');
+      }
+      if (!task.quorum) {
+        throw new Error('Task does not specify a quorum');
+      }
+
+      await TaskQueue.updateTaskStatus(task.id, 'processing', {
+        startedAt: new Date(),
+      });
+
+      for (const workerId of workerIds) {
+        await WorkerPool.updateWorkerStatus(workerId, 'busy');
+      }
+      await TaskHooks.emitTask('task.started', task);
+
+      const context: TaskExecutionContext = {
+        isCancelled: () => this.isCancelled(task.id),
+      };
+
+      const executionPromises = workerIds.map(async (workerId) => {
+        const workerStartTime = Date.now();
+        try {
+          const result = await Promise.race([
+            handler(task.payload, context),
+            new Promise<never>((_, reject) => {
+              if (!timeoutHandle) {
+                timeoutHandle = setTimeout(() => {
+                  reject(new Error(`Task execution timeout after ${task.timeout}ms`));
+                }, task.timeout);
+              }
+            }),
+          ]);
+          return { workerId, success: true, result, duration: Date.now() - workerStartTime };
+        } catch (error) {
+          return { workerId, success: false, error, duration: Date.now() - workerStartTime };
+        }
+      });
+
+      const workerResults = await Promise.all(executionPromises);
+
+      if (this.isCancelled(task.id)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled');
+        logger.info({ taskId: task.id }, 'Task cancelled during execution');
+        return;
+      }
+
+      const resultGroups = new Map<string, { result: any; workerIds: string[] }>();
+      
+      for (const r of workerResults) {
+        if (!r.success) continue;
+        
+        const hash = this._hashResult(r.result);
+        if (!resultGroups.has(hash)) {
+          resultGroups.set(hash, { result: r.result, workerIds: [] });
+        }
+        resultGroups.get(hash)!.workerIds.push(r.workerId);
+      }
+
+      let winningGroup: { result: any; workerIds: string[] } | undefined = undefined;
+      const quorumCount = task.quorum.count;
+      const strategy = task.quorum.strategy;
+
+      for (const group of resultGroups.values()) {
+        if (strategy === 'all') {
+          if (group.workerIds.length === quorumCount && workerResults.every((r) => r.success)) {
+            winningGroup = group;
+            break;
+          }
+        } else if (strategy === 'majority' || strategy === 'weighted') {
+          if (group.workerIds.length > quorumCount / 2) {
+            winningGroup = group;
+            break;
+          }
+        }
+      }
+
+      if (winningGroup) {
+        await TaskQueue.updateTaskStatus(task.id, 'completed', {
+          result: winningGroup.result,
+          completedAt: new Date(),
+        });
+
+        for (const r of workerResults) {
+          const workerForCost = await WorkerPool.getWorker(r.workerId);
+          const costIncurred = workerForCost && (WorkerPool as any).calculateTaskCost ? (WorkerPool as any).calculateTaskCost(workerForCost, task) : 0;
+          const isWinner = winningGroup.workerIds.includes(r.workerId);
+          
+          await WorkerPool.completeTask(r.workerId, task.id, {
+            duration: r.duration,
+            success: isWinner,
+            retriesUsed: task.retries,
+            memory: 0,
+            cpu: 0,
+            ...costIncurred ? { costIncurred } : {}
+          });
+        }
+
+        const duration = Date.now() - startTime;
+        await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result: winningGroup.result });
+
+        if (task.callbackUrl) {
+          await deliverCallback({ ...task, status: 'completed', completedAt: new Date() }, winningGroup.result);
+        }
+
+        logger.info({ taskId: task.id, duration, winningWorkers: winningGroup.workerIds.length }, 'Task reached consensus');
+      } else {
+        throw new Error('Consensus not reached');
+      }
+    } catch (error: any) {
+      const duration = Date.now() - startTime;
+      const errorMessage = error?.message || String(error);
+
+      logger.error({ taskId: task.id, error: errorMessage, duration }, 'Task consensus execution failed');
+
+      const retried = await TaskQueue.retryTask(task.id);
+      await TaskHooks.emitTask(retried ? 'task.retried' : 'task.failed', {
+        ...task,
+        status: retried ? 'retry' : 'failed',
+        error: errorMessage,
+      });
+
+      if (!retried) {
+        await TaskQueue.updateTaskStatus(task.id, 'failed', {
+          error: errorMessage,
+          completedAt: new Date(),
+        });
+      }
+
+      for (const workerId of workerIds) {
+        const workerForCost = await WorkerPool.getWorker(workerId);
+        const costIncurred = workerForCost && (WorkerPool as any).calculateTaskCost ? (WorkerPool as any).calculateTaskCost(workerForCost, task) : 0;
+
+        await WorkerPool.completeTask(workerId, task.id, {
+          duration,
+          success: false,
+          retriesUsed: task.retries,
+          memory: 0,
+          cpu: 0,
+          ...costIncurred ? { costIncurred } : {}
+        });
+      }
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      this.clearCancellation(task.id);
+
+      for (const workerId of workerIds) {
+        const worker = await WorkerPool.getWorker(workerId);
+        if (worker) {
+          await WorkerPool.updateWorkerStatus(workerId, worker.currentTasks > 0 ? 'busy' : 'idle');
+        }
+      }
+    }
+  }
+
+  /**
    * Execute a batch of tasks on a worker.
    *
    * Tasks run concurrently; each goes through the normal single-task lifecycle,
@@ -223,5 +396,23 @@ export class TaskExecutor {
         reject(new Error(`Task execution timeout after ${timeoutMs}ms`));
       }, timeoutMs);
     });
+  }
+
+  private static _hashResult(result: any): string {
+    if (result === undefined) return 'undefined';
+    if (result === null) return 'null';
+    if (typeof result !== 'object') return String(result);
+
+    if (Array.isArray(result)) {
+      return JSON.stringify(result.map((item) => this._hashResult(item)));
+    }
+    
+    // Sort keys to make object hashing deterministic
+    const sortedKeys = Object.keys(result).sort();
+    const sortedObj: any = {};
+    for (const key of sortedKeys) {
+      sortedObj[key] = result[key];
+    }
+    return JSON.stringify(sortedObj);
   }
 }
