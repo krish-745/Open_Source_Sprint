@@ -2,6 +2,7 @@ import { getRedisClient } from './redis';
 import logger from '../utils/logger';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
+import { Task } from '../types';
 
 const METRICS_PREFIX = 'metrics:';
 const SNAPSHOT_PREFIX = 'snapshot:';
@@ -14,8 +15,106 @@ export interface SystemMetrics {
   system: Record<string, any>;
 }
 
+export interface SlaEvaluation {
+  taskId: string;
+  priority: string;
+  waitMs: number;
+  targetMs: number;
+  compliant: boolean;
+}
+
+export interface SlaReport {
+  total: number;
+  compliant: number;
+  complianceRate: number; // 0-1
+  byPriority: Record<string, { total: number; compliant: number; complianceRate: number }>;
+  violations: SlaEvaluation[];
+}
+
 export class MetricsCollector {
   private static collectionRunning = false;
+
+  // Maximum number of snapshots to retain. Older snapshots are pruned after
+  // each capture so the snapshot set stays a bounded sliding window rather than
+  // growing until the 7-day TTL expires.
+  private static maxSnapshots = 1000;
+
+  /**
+   * Configure how many snapshots to keep (sliding-window retention).
+   */
+  static setMaxSnapshots(max: number): void {
+    if (max > 0) {
+      this.maxSnapshots = max;
+    }
+  }
+
+  /**
+   * SLA target wait time (seconds, from creation to start) per priority.
+   * Higher priorities get tighter targets. Configurable.
+   */
+  static slaTargetsSeconds: Record<string, number> = {
+    critical: 5,
+    high: 30,
+    medium: 120,
+    low: 600,
+  };
+
+  /**
+   * Evaluate a single task against its priority SLA. Wait time is measured from
+   * creation to start (or to `now` if it hasn't started yet).
+   */
+  static evaluateSla(task: Task, now: number = Date.now()): SlaEvaluation {
+    const created = new Date(task.createdAt).getTime();
+    const end = task.startedAt ? new Date(task.startedAt).getTime() : now;
+    const waitMs = Math.max(0, end - created);
+    const targetSec = this.slaTargetsSeconds[task.priority] ?? this.slaTargetsSeconds.medium;
+    const targetMs = targetSec * 1000;
+    return {
+      taskId: task.id,
+      priority: task.priority,
+      waitMs,
+      targetMs,
+      compliant: waitMs <= targetMs,
+    };
+  }
+
+  /**
+   * Aggregate SLA compliance across tasks, overall and per priority, and log an
+   * alert for any violations so operators can react when an SLA is breached.
+   */
+  static checkSlaCompliance(tasks: Task[], now: number = Date.now()): SlaReport {
+    const byPriority: SlaReport['byPriority'] = {};
+    const violations: SlaEvaluation[] = [];
+    let compliant = 0;
+
+    for (const task of tasks) {
+      const evalResult = this.evaluateSla(task, now);
+      const bucket = (byPriority[evalResult.priority] ??= { total: 0, compliant: 0, complianceRate: 0 });
+      bucket.total++;
+      if (evalResult.compliant) {
+        bucket.compliant++;
+        compliant++;
+      } else {
+        violations.push(evalResult);
+      }
+    }
+
+    for (const bucket of Object.values(byPriority)) {
+      bucket.complianceRate = bucket.total > 0 ? bucket.compliant / bucket.total : 1;
+    }
+
+    if (violations.length > 0) {
+      logger.warn({ violations: violations.length }, 'SLA violations detected');
+    }
+
+    return {
+      total: tasks.length,
+      compliant,
+      complianceRate: tasks.length > 0 ? compliant / tasks.length : 1,
+      byPriority,
+      violations,
+    };
+  }
 
   /**
    * Start collecting metrics periodically
@@ -102,9 +201,36 @@ export class MetricsCollector {
     const snapshotKey = `${SNAPSHOT_PREFIX}${Date.now()}`;
     await client.set(snapshotKey, JSON.stringify(metrics), { EX: 7 * 24 * 60 * 60 });
 
+    // Enforce the retention window so snapshots don't accumulate unbounded.
+    await this._pruneOldSnapshots();
+
     logger.debug({ timestamp }, 'Metrics snapshot captured');
 
     return metrics;
+  }
+
+  /**
+   * Delete snapshots beyond the configured retention limit, keeping the newest
+   * `maxSnapshots` by numeric timestamp.
+   */
+  private static async _pruneOldSnapshots(): Promise<void> {
+    const client = getRedisClient();
+    const keys = await client.keys(`${SNAPSHOT_PREFIX}*`);
+
+    if (keys.length <= this.maxSnapshots) {
+      return;
+    }
+
+    const sortedNewestFirst = keys.sort(
+      (a, b) => this._extractSnapshotTimestamp(b) - this._extractSnapshotTimestamp(a)
+    );
+    const toDelete = sortedNewestFirst.slice(this.maxSnapshots);
+
+    for (const key of toDelete) {
+      await client.del(key);
+    }
+
+    logger.debug({ pruned: toDelete.length, retained: this.maxSnapshots }, 'Old metric snapshots pruned');
   }
 
   /**
