@@ -90,6 +90,21 @@ function makeFakeRedis() {
     // --- pattern ---
     keys: jest.fn(async () => [] as string[]),
 
+    // --- transactions / batch ---
+    mGet: jest.fn(async (keys: string[]) => keys.map((k: string) => strings.get(k) ?? null)),
+    hDel: jest.fn(async (k: string, field: string) => { _hash(k).delete(field); return 1; }),
+    multi: jest.fn(() => {
+      const m: any = {
+        zRem: jest.fn((k, val) => { zsets.get(k)?.delete(val); return m; }),
+        zAdd: jest.fn((k, item) => {
+          const z = zsets.get(k) ?? new Map<string, number>();
+          z.set(item.value, item.score); zsets.set(k, z); return m;
+        }),
+        exec: jest.fn(async () => [['OK']]),
+      };
+      return m;
+    }),
+
     __strings: strings,
     __hashes: hashes,
   } as any;

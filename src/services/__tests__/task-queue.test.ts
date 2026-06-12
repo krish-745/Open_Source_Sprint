@@ -729,4 +729,5 @@ describe('TaskQueue Tests', () => {
       expect(mockRedisClient.zAdd).toHaveBeenCalledWith('queue:default', expect.any(Object));
     });
   });
+  });
 });
