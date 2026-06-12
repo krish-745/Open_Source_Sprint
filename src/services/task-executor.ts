@@ -2,13 +2,37 @@ import logger from '../utils/logger';
 import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
+import { TaskHooks } from './task-hooks';
+
+export interface TaskExecutionContext {
+  /** Handlers can poll this to cooperatively stop work when cancelled. */
+  isCancelled: () => boolean;
+}
 
 export interface TaskHandler {
-  (payload: Record<string, any>): Promise<any>;
+  (payload: Record<string, any>, context?: TaskExecutionContext): Promise<any>;
 }
 
 export class TaskExecutor {
   private static handlers: Map<string, TaskHandler> = new Map();
+  private static cancelledTasks: Set<string> = new Set();
+
+  /**
+   * Request cancellation of a task. Removes it from the queue side via
+   * TaskQueue.cancelTask; here we record the signal so a running handler can
+   * observe it and the executor skips it if not yet started.
+   */
+  static cancel(taskId: string): void {
+    this.cancelledTasks.add(taskId);
+  }
+
+  static isCancelled(taskId: string): boolean {
+    return this.cancelledTasks.has(taskId);
+  }
+
+  static clearCancellation(taskId: string): void {
+    this.cancelledTasks.delete(taskId);
+  }
 
   /**
    * Register a task handler
@@ -26,6 +50,13 @@ export class TaskExecutor {
     let timeoutHandle: NodeJS.Timeout | undefined;
 
     try {
+      // Skip tasks cancelled before they start.
+      if (this.isCancelled(task.id)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled');
+        logger.info({ taskId: task.id }, 'Task cancelled before execution');
+        return;
+      }
+
       // Validate handler exists
       const handler = this.handlers.get(task.handler);
       if (!handler) {
@@ -44,16 +75,27 @@ export class TaskExecutor {
       });
 
       await WorkerPool.updateWorkerStatus(workerId, 'busy');
+      await TaskHooks.emitTask('task.started', task);
 
-      // Execute with timeout
+      // Execute with timeout, passing a cancellation-aware context.
+      const context: TaskExecutionContext = {
+        isCancelled: () => this.isCancelled(task.id),
+      };
       const result = await Promise.race([
-        handler(task.payload),
+        handler(task.payload, context),
         new Promise<never>((_, reject) => {
           timeoutHandle = setTimeout(() => {
             reject(new Error(`Task execution timeout after ${task.timeout}ms`));
           }, task.timeout);
         }),
       ]);
+
+      // If the task was cancelled mid-flight, record it rather than completing.
+      if (this.isCancelled(task.id)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled');
+        logger.info({ taskId: task.id }, 'Task cancelled during execution');
+        return;
+      }
 
       // Mark as completed
       await TaskQueue.updateTaskStatus(task.id, 'completed', {
@@ -70,6 +112,8 @@ export class TaskExecutor {
         cpu: 0,
       });
 
+      await TaskHooks.emitTask('task.completed', { ...task, status: 'completed', result });
+
       logger.info({ taskId: task.id, duration }, 'Task completed successfully');
     } catch (error: any) {
       const duration = Date.now() - startTime;
@@ -79,6 +123,11 @@ export class TaskExecutor {
 
       // Attempt retry
       const retried = await TaskQueue.retryTask(task.id);
+      await TaskHooks.emitTask(retried ? 'task.retried' : 'task.failed', {
+        ...task,
+        status: retried ? 'retry' : 'failed',
+        error: errorMessage,
+      });
 
       if (retried) {
         await WorkerPool.completeTask(workerId, task.id, {
@@ -105,6 +154,7 @@ export class TaskExecutor {
       }
     } finally {
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      this.clearCancellation(task.id);
 
       // Reflect the worker's actual state: it is only idle once it has no
       // remaining tasks. With concurrent execution, other tasks may still be
@@ -114,6 +164,28 @@ export class TaskExecutor {
         await WorkerPool.updateWorkerStatus(workerId, worker.currentTasks > 0 ? 'busy' : 'idle');
       }
     }
+  }
+
+  /**
+   * Execute a batch of tasks on a worker.
+   *
+   * Tasks run concurrently; each goes through the normal single-task lifecycle,
+   * so one task failing does not abort the others (partial-batch failure
+   * handling). Returns a summary with per-batch performance metrics.
+   */
+  static async executeBatch(
+    workerId: string,
+    tasks: Task[]
+  ): Promise<{ total: number; succeeded: number; failed: number; durationMs: number }> {
+    const start = Date.now();
+    const results = await Promise.allSettled(tasks.map((task) => this.execute(workerId, task)));
+
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    const succeeded = results.length - failed;
+    const durationMs = Date.now() - start;
+
+    logger.info({ workerId, total: tasks.length, succeeded, failed, durationMs }, 'Batch executed');
+    return { total: tasks.length, succeeded, failed, durationMs };
   }
 
   /**
