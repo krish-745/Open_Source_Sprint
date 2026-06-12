@@ -11,6 +11,15 @@ function makeClient() {
     zAdd: jest.fn().mockResolvedValue(1),
     zCard: jest.fn().mockResolvedValue(0),
     hIncrBy: jest.fn().mockResolvedValue(1),
+    hGet: jest.fn().mockResolvedValue(null),
+    multi: jest.fn().mockImplementation(() => {
+      const m: any = {
+        zRem: jest.fn().mockReturnThis(),
+        zAdd: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue([['OK']]),
+      };
+      return m;
+    }),
   } as any;
 }
 

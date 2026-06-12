@@ -27,6 +27,12 @@ export interface Task {
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
+  consensus?: ConsensusOptions;
+}
+
+export interface ConsensusOptions {
+  workers: number;
+  strategy: 'all' | 'majority' | 'weighted';
 }
 
 /**

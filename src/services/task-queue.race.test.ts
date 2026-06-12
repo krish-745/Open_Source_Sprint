@@ -34,7 +34,12 @@ function buildTask(overrides: Partial<Task> = {}): Task {
  */
 function makeClient(taskJson: string | null, execImpl: jest.Mock) {
   const setSpy = jest.fn().mockReturnThis();
-  const multi = { set: setSpy, exec: execImpl };
+  const multi = { 
+    set: setSpy, 
+    zAdd: jest.fn().mockReturnThis(), 
+    zRem: jest.fn().mockReturnThis(), 
+    exec: execImpl 
+  };
   const client: any = {
     watch: jest.fn().mockResolvedValue('OK'),
     unwatch: jest.fn().mockResolvedValue('OK'),

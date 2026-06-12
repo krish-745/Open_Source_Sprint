@@ -43,7 +43,7 @@ router.get('/templates', (_req: Request, res: Response) => {
 
 router.post('/tasks', async (req: Request, res: Response) => {
   try {
-    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, templateName } = req.body;
+    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, templateName, consensus } = req.body;
 
     // If a template is named, apply it for the handler/payload/priority.
     let effectiveHandler = handler;
@@ -64,6 +64,16 @@ router.post('/tasks', async (req: Request, res: Response) => {
       return res.status(400).json({ error: `Unknown handler: ${effectiveHandler}` });
     }
 
+    if (consensus !== undefined) {
+      const validStrategies = ['majority', 'all', 'weighted'];
+      if (!consensus.strategy || !validStrategies.includes(consensus.strategy)) {
+        return res.status(400).json({ error: `Invalid consensus.strategy. Must be one of: ${validStrategies.join(', ')}` });
+      }
+      if (!Number.isInteger(consensus.workers) || consensus.workers < 2) {
+        return res.status(400).json({ error: 'consensus.workers must be an integer >= 2' });
+      }
+    }
+
     if (effectivePayload !== undefined && effectivePayload !== null && (typeof effectivePayload !== 'object' || Array.isArray(effectivePayload))) {
       return res.status(400).json({ error: 'Payload must be a valid object' });
     }
@@ -74,6 +84,7 @@ router.post('/tasks', async (req: Request, res: Response) => {
       maxRetries,
       timeout,
       tags,
+      consensus,
     });
 
     res.status(201).json(task);
@@ -126,6 +137,15 @@ router.post('/tasks/batch', async (req: Request, res: Response) => {
       if (!TaskExecutor.hasHandler(t.handler)) {
         return res.status(400).json({ error: `Unknown handler at index ${index}: ${t.handler}` });
       }
+      if (t.consensus !== undefined) {
+        const validStrategies = ['majority', 'all', 'weighted'];
+        if (!t.consensus.strategy || !validStrategies.includes(t.consensus.strategy)) {
+          return res.status(400).json({ error: `Invalid consensus.strategy at index ${index}. Must be one of: ${validStrategies.join(', ')}` });
+        }
+        if (!Number.isInteger(t.consensus.workers) || t.consensus.workers < 2) {
+          return res.status(400).json({ error: `consensus.workers at index ${index} must be an integer >= 2` });
+        }
+      }
     }
 
     const created = await TaskQueue.createTasksBatch(
@@ -139,6 +159,7 @@ router.post('/tasks/batch', async (req: Request, res: Response) => {
           maxRetries: t.maxRetries,
           timeout: t.timeout,
           tags: t.tags,
+          consensus: t.consensus,
         },
       }))
     );
