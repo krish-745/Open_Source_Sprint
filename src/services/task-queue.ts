@@ -11,6 +11,17 @@ const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
 
 /**
+ * Thrown when a task's dependencies would introduce a circular dependency.
+ * Carries the offending cycle (as a list of task ids) for the caller to report.
+ */
+export class DependencyCycleError extends Error {
+  constructor(message: string, public readonly cycle: string[]) {
+    super(message);
+    this.name = 'DependencyCycleError';
+  }
+}
+
+/**
  * Thrown when a queue has reached its maximum capacity (backpressure).
  * The API layer maps this to HTTP 429 Too Many Requests.
  */
@@ -72,6 +83,17 @@ export class TaskQueue {
       tags: options.tags || [],
       metadata: options.metadata || {},
     };
+
+    // Reject tasks that would introduce a circular dependency.
+    if (task.dependencies.length > 0) {
+      const cycle = await this._detectDependencyCycle(taskId, task.dependencies);
+      if (cycle) {
+        throw new DependencyCycleError(
+          `Circular dependency detected: ${cycle.join(' -> ')}`,
+          cycle
+        );
+      }
+    }
 
     // Store task
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
@@ -383,6 +405,51 @@ export class TaskQueue {
       low: 1,
     };
     return (priorityMap[priority] || 10) + Math.random();
+  }
+
+  /**
+   * Detect a circular dependency reachable from a new task using depth-first
+   * search. The new task (`rootId`) is treated as a graph node whose edges are
+   * its declared `rootDeps`; every other node's edges are read from the stored
+   * task's `dependencies`. Returns the cycle as an ordered list of task ids, or
+   * `null` if the dependency graph is acyclic. Transitive dependencies are
+   * followed, and missing/unknown dependencies are treated as leaf nodes.
+   */
+  private static async _detectDependencyCycle(
+    rootId: string,
+    rootDeps: string[]
+  ): Promise<string[] | null> {
+    const visited = new Set<string>();
+    const inStack = new Set<string>();
+    const path: string[] = [];
+
+    const dfs = async (node: string): Promise<string[] | null> => {
+      if (inStack.has(node)) {
+        const start = path.indexOf(node);
+        return [...path.slice(start), node];
+      }
+      if (visited.has(node)) {
+        return null;
+      }
+
+      visited.add(node);
+      inStack.add(node);
+      path.push(node);
+
+      const deps = node === rootId ? rootDeps : (await this.getTask(node))?.dependencies ?? [];
+      for (const dep of deps) {
+        const cycle = await dfs(dep);
+        if (cycle) {
+          return cycle;
+        }
+      }
+
+      inStack.delete(node);
+      path.pop();
+      return null;
+    };
+
+    return dfs(rootId);
   }
 
   private static async _checkDependencies(dependencyIds: string[]): Promise<boolean> {
