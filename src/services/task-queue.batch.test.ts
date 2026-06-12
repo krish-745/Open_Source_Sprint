@@ -9,10 +9,19 @@ function makeClient() {
   return {
     set: jest.fn().mockResolvedValue('OK'),
     zAdd: jest.fn().mockResolvedValue(1),
+    zCard: jest.fn().mockResolvedValue(0),   // queue never full
     hIncrBy: jest.fn().mockResolvedValue(1),
-    zCard: jest.fn().mockResolvedValue(0),
     sAdd: jest.fn().mockResolvedValue(1),
     expire: jest.fn().mockResolvedValue(1),
+    hGet: jest.fn().mockResolvedValue(null), // no budget set → no enforcement
+    multi: jest.fn().mockImplementation(() => {
+      const m: any = {
+        zRem: jest.fn().mockReturnThis(),
+        zAdd: jest.fn().mockReturnThis(),
+        exec: jest.fn().mockResolvedValue([['OK']]),
+      };
+      return m;
+    }),
   } as any;
 }
 

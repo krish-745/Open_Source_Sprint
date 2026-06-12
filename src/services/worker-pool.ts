@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getRedisClient } from './redis';
 import logger from '../utils/logger';
+import { TaskQueue } from './task-queue';
 import { Worker, WorkerStatus, Task, TaskExecutionMetrics } from '../types';
 
 const WORKER_PREFIX = 'worker:';
@@ -118,9 +119,20 @@ export class WorkerPool {
       }
     }
 
-    // Sort by capacity (least busy first)
-    availableWorkers.sort((a, b) => a.capacity - b.capacity);
-    return availableWorkers;
+    const workersWithCost = await Promise.all(
+      availableWorkers.map(async (worker) => {
+        const cost = await this.getWorkerCost(worker.id);
+        return { worker, cost };
+      })
+    );
+
+    // Sort by cost (cheapest first), then by capacity (least busy first)
+    workersWithCost.sort((a, b) => {
+      if (a.cost !== b.cost) return a.cost - b.cost;
+      return a.worker.capacity - b.worker.capacity;
+    });
+
+    return workersWithCost.map(wc => wc.worker);
   }
 
   /**
@@ -181,6 +193,17 @@ export class WorkerPool {
       }),
       { EX: 7 * 24 * 60 * 60 } // 7 days retention
     );
+
+    // Accrue cost. Use ?? (not ||) so that an explicit cost of 0 (free task)
+    // is honoured and does not fall back to the worker's default costPerTask.
+    // Clamp negatives/NaN to the worker default so invalid metadata can never
+    // corrupt the running total.
+    const task = await TaskQueue.getTask(taskId);
+    const rawTaskCost = task?.metadata?.cost ?? await this.getWorkerCost(workerId);
+    const taskCost = Number.isFinite(rawTaskCost) && rawTaskCost >= 0
+      ? rawTaskCost
+      : await this.getWorkerCost(workerId);
+    await client.hIncrBy('worker:cost:total', workerId, taskCost);
   }
 
   /**
@@ -213,14 +236,45 @@ export class WorkerPool {
     for (const workerId of allWorkers) {
       const worker = await this.getWorker(workerId);
       if (worker && now - new Date(worker.lastHeartbeat).getTime() > timeout) {
-        worker.status = 'offline';
-        await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+        // Mark offline and reassign any tasks the worker was processing.
+        await this.handleWorkerDisconnect(workerId);
         staleCount++;
-        logger.warn({ workerId }, 'Worker marked as offline');
       }
     }
 
     return staleCount;
+  }
+
+  /**
+   * Handle a worker disconnecting (crash or missed heartbeats): requeue any
+   * tasks it was processing so other workers can pick them up, clear its task
+   * assignment and counters, and mark it offline. Returns the number of tasks
+   * reassigned.
+   */
+  static async handleWorkerDisconnect(workerId: string): Promise<number> {
+    const client = getRedisClient();
+    const taskListKey = `worker:${workerId}:tasks`;
+
+    const taskIds = await client.lRange(taskListKey, 0, -1);
+    let reassigned = 0;
+    for (const taskId of taskIds) {
+      const requeued = await TaskQueue.requeueTask(taskId);
+      if (requeued) {
+        reassigned++;
+      }
+    }
+    await client.del(taskListKey);
+
+    const worker = await this.getWorker(workerId);
+    if (worker) {
+      worker.status = 'offline';
+      worker.currentTasks = 0;
+      worker.capacity = 0;
+      await client.set(`${WORKER_PREFIX}${workerId}`, JSON.stringify(worker));
+    }
+
+    logger.warn({ workerId, reassigned }, 'Worker disconnected; tasks reassigned and worker marked offline');
+    return reassigned;
   }
 
   /**
@@ -329,5 +383,37 @@ export class WorkerPool {
     await client.zRem(WORKERS_INDEX, workerId);
 
     logger.info({ workerId }, 'Worker unregistered');
+  }
+
+  /**
+   * Set cost per task for a worker
+   */
+  static async setWorkerCost(workerId: string, costPerTask: number): Promise<void> {
+    const client = getRedisClient();
+    await client.hSet('worker:cost:config', workerId, costPerTask.toString());
+  }
+
+  /**
+   * Get cost per task for a worker (default 1)
+   */
+  static async getWorkerCost(workerId: string): Promise<number> {
+    const client = getRedisClient();
+    const val = await client.hGet('worker:cost:config', workerId);
+    return val ? parseInt(val, 10) : 1;
+  }
+
+  /**
+   * Get cost metrics for a worker
+   */
+  static async getWorkerCostMetrics(workerId: string) {
+    const client = getRedisClient();
+    const costPerTask = await this.getWorkerCost(workerId);
+    const totalVal = await client.hGet('worker:cost:total', workerId);
+    const totalCostAccrued = totalVal ? parseInt(totalVal, 10) : 0;
+    
+    return {
+      costPerTask,
+      totalCostAccrued,
+    };
   }
 }
