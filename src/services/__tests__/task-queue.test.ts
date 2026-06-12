@@ -31,6 +31,7 @@ const mockRedisClient = {
     return list.slice(start, end);
   }),
   hIncrBy: jest.fn().mockResolvedValue(1),
+  hDel: jest.fn().mockResolvedValue(1),
   lPush: jest.fn().mockResolvedValue(1),
   del: jest.fn().mockImplementation(async (key: string) => {
     delete store[key];

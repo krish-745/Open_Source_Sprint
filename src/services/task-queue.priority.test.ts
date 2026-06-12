@@ -39,6 +39,7 @@ describe('TaskQueue.getNextTask priority handling', () => {
     const client: any = {
       zRange: jest.fn().mockResolvedValue(['high', 'low']),
       get: jest.fn((k: string) => Promise.resolve(store[k] ?? null)),
+      zRem: jest.fn().mockResolvedValue(1),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
@@ -65,6 +66,7 @@ describe('TaskQueue.getNextTask priority handling', () => {
     const client: any = {
       zRange: jest.fn().mockResolvedValue(ids),
       get: jest.fn((k: string) => Promise.resolve(store[k] ?? null)),
+      zRem: jest.fn().mockResolvedValue(1),
     };
     mockedGetRedisClient.mockReturnValue(client);
 

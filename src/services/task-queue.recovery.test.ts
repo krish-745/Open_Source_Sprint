@@ -57,6 +57,7 @@ describe('TaskQueue.recoverStaleTasks', () => {
         return Promise.resolve('OK');
       }),
       zAdd: jest.fn().mockResolvedValue(1),
+      hDel: jest.fn().mockResolvedValue(1),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
@@ -79,6 +80,7 @@ describe('TaskQueue.recoverStaleTasks', () => {
       get: jest.fn().mockResolvedValue(JSON.stringify(fresh)),
       set: jest.fn(),
       zAdd: jest.fn(),
+      hDel: jest.fn(),
     };
     mockedGetRedisClient.mockReturnValue(client);
 

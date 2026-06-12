@@ -283,7 +283,23 @@ export class TaskQueue {
         continue;
       }
 
-      return task;
+      // Try to acquire the task atomically
+      if (task.consensus) {
+        const dispatchKey = `${QUEUE_PREFIX}${queueName}:dispatch`;
+        const count = await client.hIncrBy(dispatchKey, taskId, 1);
+        if (count <= task.consensus.workers) {
+          if (count === task.consensus.workers) {
+            // Last worker needed for consensus has picked it up; remove from queue
+            await client.zRem(queueKey, taskId);
+          }
+          return task;
+        }
+      } else {
+        const removed = await client.zRem(queueKey, taskId);
+        if (removed === 1) {
+          return task;
+        }
+      }
     }
 
     return null;
@@ -317,7 +333,22 @@ export class TaskQueue {
         continue;
       }
 
-      batch.push(task);
+      // Try to acquire the task atomically
+      if (task.consensus) {
+        const dispatchKey = `${QUEUE_PREFIX}${queueName}:dispatch`;
+        const count = await client.hIncrBy(dispatchKey, taskId, 1);
+        if (count <= task.consensus.workers) {
+          if (count === task.consensus.workers) {
+            await client.zRem(queueKey, taskId);
+          }
+          batch.push(task);
+        }
+      } else {
+        const removed = await client.zRem(queueKey, taskId);
+        if (removed === 1) {
+          batch.push(task);
+        }
+      }
     }
 
     return batch;
@@ -348,6 +379,8 @@ export class TaskQueue {
     const queueKey = `${QUEUE_PREFIX}${task.queue}`;
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
+    await client.hDel(`${queueKey}:dispatch`, taskId);
+    await client.del(`task:${taskId}:consensus`);
 
     logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
     return true;
@@ -373,6 +406,8 @@ export class TaskQueue {
     task.status = 'cancelled';
     await client.set(`${TASK_PREFIX}${taskId}`, JSON.stringify(task));
     await client.zRem(`${QUEUE_PREFIX}${task.queue}`, taskId);
+    await client.hDel(`${QUEUE_PREFIX}${task.queue}:dispatch`, taskId);
+    await client.del(`task:${taskId}:consensus`);
 
     logger.info({ taskId }, 'Task cancelled');
     return true;
@@ -429,9 +464,11 @@ export class TaskQueue {
 
     for (const taskId of allTaskIds) {
       const task = await this.getTask(taskId);
-      if (task && (task.status === 'completed' || task.status === 'failed')) {
+      if (task && (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')) {
         await client.del(`${TASK_PREFIX}${taskId}`);
         await client.zRem(TASK_INDEX_KEY, taskId);
+        await client.hDel(`${QUEUE_PREFIX}${task.queue}:dispatch`, taskId);
+        await client.del(`task:${taskId}:consensus`);
         deleted++;
       }
     }
@@ -459,6 +496,7 @@ export class TaskQueue {
     const queueKey = `${QUEUE_PREFIX}${task.queue}`;
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
+    await client.hDel(`${queueKey}:dispatch`, taskId);
 
     logger.info({ taskId }, 'Task requeued');
     return true;
@@ -497,6 +535,7 @@ export class TaskQueue {
       const queueKey = `${QUEUE_PREFIX}${task.queue}`;
       const score = this._calculateQueueScore(task.priority);
       await client.zAdd(queueKey, { score, value: taskId });
+      await client.hDel(`${queueKey}:dispatch`, taskId);
 
       recovered++;
       logger.warn(
@@ -586,6 +625,8 @@ export class TaskQueue {
       task.status = 'failed';
       await client.lPush(DEAD_LETTER_QUEUE, JSON.stringify(task));
       await client.del(`${TASK_PREFIX}${taskId}`);
+      await client.hDel(`${QUEUE_PREFIX}${task.queue}:dispatch`, taskId);
+      await client.del(`task:${taskId}:consensus`);
       logger.warn({ taskId }, 'Task moved to DLQ');
     }
   }

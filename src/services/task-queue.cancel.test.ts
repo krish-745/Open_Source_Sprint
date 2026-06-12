@@ -39,6 +39,8 @@ describe('TaskQueue.cancelTask', () => {
         return Promise.resolve('OK');
       }),
       zRem: jest.fn().mockResolvedValue(1),
+      hDel: jest.fn().mockResolvedValue(1),
+      del: jest.fn().mockResolvedValue(1),
     };
     mockedGetRedisClient.mockReturnValue(client);
 
@@ -54,6 +56,8 @@ describe('TaskQueue.cancelTask', () => {
       get: jest.fn().mockResolvedValue(JSON.stringify(buildTask({ status: 'completed' }))),
       set: jest.fn(),
       zRem: jest.fn(),
+      hDel: jest.fn(),
+      del: jest.fn(),
     };
     mockedGetRedisClient.mockReturnValue(client);
 

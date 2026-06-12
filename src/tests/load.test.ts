@@ -93,12 +93,7 @@ describe('System Load Test', () => {
                     task
                 );
 
-                const client = getRedisClient();
 
-                await client.zRem(
-                    `queue:${task.queue}`,
-                    task.id
-                );
             } catch (err) {
                 console.error(
                     'Worker loop error:',
