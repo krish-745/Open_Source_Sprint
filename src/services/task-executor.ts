@@ -59,6 +59,15 @@ export class TaskExecutor {
         return;
       }
 
+      // Do not run tasks that expired before they were picked up.
+      if (TaskQueue.isExpired(task)) {
+        await TaskQueue.updateTaskStatus(task.id, 'cancelled', {
+          error: 'Task expired before execution',
+        });
+        logger.warn({ taskId: task.id }, 'Skipped expired task');
+        return;
+      }
+
       // If task is already completed/failed, skip processing to avoid straggler workers overriding state.
       const currentTask = await TaskQueue.getTask(task.id);
       if (currentTask && (currentTask.status === 'completed' || currentTask.status === 'failed')) {
