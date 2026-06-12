@@ -24,9 +24,21 @@ export interface Task {
   scheduledFor?: Date; // For delayed tasks
   ttl?: number; // Time-to-live in seconds before an unstarted task expires
   expiresAt?: Date; // Absolute expiry time, derived from ttl at creation
+  branches?: TaskBranch[]; // Conditional next-steps evaluated against the result
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
+}
+
+/**
+ * A conditional branch: if the task result matches `condition`, the referenced
+ * next task/template should run. `condition` is matched against the stringified
+ * result; prefix it with `regex:` to match with a regular expression.
+ */
+export interface TaskBranch {
+  condition: string;
+  nextTaskId?: string;
+  nextTemplate?: string;
 }
 
 export type TaskStatus =

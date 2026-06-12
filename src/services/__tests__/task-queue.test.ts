@@ -1,25 +1,94 @@
 import { TaskQueue } from '../task-queue';
 import { getRedisClient } from '../redis';
+import { Task } from '../../types';
 
-jest.mock('../redis', () => {
-  const mClient = {
-    get: jest.fn(),
-    set: jest.fn(),
-    zAdd: jest.fn(),
-    zCard: jest.fn(),
-    hIncrBy: jest.fn(),
-    lPush: jest.fn(),
-    del: jest.fn(),
-  };
-  return { getRedisClient: jest.fn(() => mClient) };
-});
+const store: Record<string, string> = {};
+const queueStore: Record<string, string[]> = {};
 
-describe('TaskQueue', () => {
-  let redisClient: any;
+const mockRedisClient = {
+  get: jest.fn().mockImplementation(async (key: string) => store[key] || null),
+  set: jest.fn().mockImplementation(async (key: string, value: string) => {
+    store[key] = value;
+    return 'OK';
+  }),
+  zAdd: jest.fn().mockImplementation(async (key: string, item: { score: number; value: string }) => {
+    if (!queueStore[key]) {
+      queueStore[key] = [];
+    }
+    queueStore[key] = queueStore[key].filter(v => v !== item.value);
+    queueStore[key].push(item.value);
+    return 1;
+  }),
+  zCard: jest.fn().mockImplementation(async (key: string) => {
+    return (queueStore[key] || []).length;
+  }),
+  zRange: jest.fn().mockImplementation(async (key: string, start: number, stop: number, options?: any) => {
+    const list = queueStore[key] || [];
+    if (start === 0 && stop === -1) {
+      return list;
+    }
+    const end = stop < 0 ? list.length : stop + 1;
+    return list.slice(start, end);
+  }),
+  hIncrBy: jest.fn().mockResolvedValue(1),
+  lPush: jest.fn().mockResolvedValue(1),
+  del: jest.fn().mockImplementation(async (key: string) => {
+    delete store[key];
+    return 1;
+  }),
+};
 
+jest.mock('../redis', () => ({
+  getRedisClient: () => mockRedisClient,
+}));
+
+describe('TaskQueue Tests', () => {
   beforeEach(() => {
-    redisClient = getRedisClient();
+    for (const key in store) delete store[key];
+    for (const key in queueStore) delete queueStore[key];
     jest.clearAllMocks();
+  });
+
+  describe('createTask payload validation', () => {
+    it('should create a task with a valid object payload', async () => {
+      const payload = { key: 'value' };
+      const task = await TaskQueue.createTask('Test Task', 'testHandler', payload);
+      
+      expect(task).toBeDefined();
+      expect(task.payload).toEqual(payload);
+    });
+
+    it('should default null payload to an empty object', async () => {
+      const task = await TaskQueue.createTask('Test Task', 'testHandler', null);
+      
+      expect(task).toBeDefined();
+      expect(task.payload).toEqual({});
+    });
+
+    it('should default undefined payload to an empty object', async () => {
+      const task = await TaskQueue.createTask('Test Task', 'testHandler', undefined);
+      
+      expect(task).toBeDefined();
+      expect(task.payload).toEqual({});
+    });
+
+    it('should throw an error if payload is a string', async () => {
+      await expect(
+        TaskQueue.createTask('Test Task', 'testHandler', 'invalid-string' as any)
+      ).rejects.toThrow('Payload must be a valid object');
+    });
+
+    it('should throw an error if payload is an array', async () => {
+      await expect(
+        TaskQueue.createTask('Test Task', 'testHandler', [1, 2, 3] as any)
+      ).rejects.toThrow('Payload must be a valid object');
+    });
+
+    it('should throw an error if payload is a number', async () => {
+      await expect(
+        TaskQueue.createTask('Test Task', 'testHandler', 123 as any)
+      ).rejects.toThrow('Payload must be a valid object');
+    });
   });
 
   describe('retryTask (Fix #18)', () => {
@@ -35,16 +104,11 @@ describe('TaskQueue', () => {
         priority: 'medium',
       };
 
-      redisClient.get.mockResolvedValue(JSON.stringify(mockTask));
+      store['task:task-1'] = JSON.stringify(mockTask);
 
       await TaskQueue.retryTask('task-1');
 
-      const setCall = redisClient.set.mock.calls[0];
-      expect(setCall).toBeDefined();
-
-      const savedTask = JSON.parse(setCall[1]);
-
-      // error must be completely absent from the serialized object
+      const savedTask = JSON.parse(store['task:task-1']);
       expect(Object.keys(savedTask)).not.toContain('error');
       expect(savedTask.error).toBeUndefined();
     });
@@ -61,11 +125,11 @@ describe('TaskQueue', () => {
         priority: 'high',
       };
 
-      redisClient.get.mockResolvedValue(JSON.stringify(mockTask));
+      store['task:task-2'] = JSON.stringify(mockTask);
 
       await TaskQueue.retryTask('task-2');
 
-      const savedTask = JSON.parse(redisClient.set.mock.calls[0][1]);
+      const savedTask = JSON.parse(store['task:task-2']);
       expect(savedTask.status).toBe('retry');
       expect(savedTask.retries).toBe(2);
     });
@@ -82,37 +146,37 @@ describe('TaskQueue', () => {
         priority: 'low',
       };
 
-      redisClient.get.mockResolvedValue(JSON.stringify(mockTask));
+      store['task:task-3'] = JSON.stringify(mockTask);
 
       const result = await TaskQueue.retryTask('task-3');
 
       expect(result).toBe(false);
-      expect(redisClient.set).not.toHaveBeenCalled();
+      expect(store['task:task-3']).toBeUndefined();
     });
   });
 
   describe('createTask (Fix #22)', () => {
     it('should reject new tasks when queue size exceeds MAX_QUEUE_SIZE limit', async () => {
-      // Configure max size to 100
       process.env.MAX_QUEUE_SIZE = '100';
-      
-      // Simulate queue already having 100 tasks
-      redisClient.zCard.mockResolvedValue(100);
+      const zCardSpy = jest.spyOn(mockRedisClient, 'zCard').mockResolvedValueOnce(100);
       
       await expect(
         TaskQueue.createTask('test-task', 'test-handler', {})
       ).rejects.toThrow(/Queue default exceeds maximum size of 100/i);
+
+      zCardSpy.mockRestore();
     });
 
     it('should allow task creation when queue size is below MAX_QUEUE_SIZE limit', async () => {
       process.env.MAX_QUEUE_SIZE = '100';
-      redisClient.zCard.mockResolvedValue(99);
-      redisClient.zAdd.mockResolvedValue(1); // Mock adding to set
+      const zCardSpy = jest.spyOn(mockRedisClient, 'zCard').mockResolvedValueOnce(99);
 
       const task = await TaskQueue.createTask('test-task', 'test-handler', {});
       
       expect(task).toBeDefined();
       expect(task.name).toBe('test-task');
+
+      zCardSpy.mockRestore();
     });
   });
 });
