@@ -43,6 +43,7 @@ router.get('/templates', (_req: Request, res: Response) => {
 
 router.post('/tasks', async (req: Request, res: Response) => {
   try {
+    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, groupId } = req.body;
     const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, templateName } = req.body;
 
     // If a template is named, apply it for the handler/payload/priority.
@@ -74,6 +75,7 @@ router.post('/tasks', async (req: Request, res: Response) => {
       maxRetries,
       timeout,
       tags,
+      groupId,
     });
 
     res.status(201).json(task);
@@ -123,6 +125,7 @@ router.post('/tasks/batch', async (req: Request, res: Response) => {
           maxRetries: t.maxRetries,
           timeout: t.timeout,
           tags: t.tags,
+          groupId: t.groupId,
         },
       }))
     );
@@ -150,6 +153,18 @@ router.get('/tasks/:taskId', async (req: Request, res: Response) => {
   }
 });
 
+router.get('/groups/:groupId/status', async (req: Request, res: Response) => {
+  try {
+    const { groupId } = req.params;
+    const status = await TaskQueue.getGroupStatus(groupId);
+
+    if (!status) {
+      return res.status(404).json({ error: `Group ${groupId} not found` });
+    }
+
+    res.json(status);
+  } catch (error: any) {
+    logger.error({ error }, 'Get group status error');
 router.patch('/tasks/:taskId', async (req: Request, res: Response) => {
   try {
     const { taskId } = req.params;

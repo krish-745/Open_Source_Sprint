@@ -27,6 +27,7 @@ export interface Task {
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
+  groupId?: string;
 }
 
 /**

@@ -2,6 +2,20 @@ import { TaskQueue, QueueFullError } from '../task-queue';
 import { getRedisClient } from '../redis';
 import { Task } from '../../types';
 
+jest.mock('../redis', () => {
+  const mClient = {
+    get: jest.fn(),
+    set: jest.fn(),
+    zAdd: jest.fn(),
+    zCard: jest.fn(),
+    hIncrBy: jest.fn(),
+    lPush: jest.fn(),
+    del: jest.fn(),
+    sAdd: jest.fn(),
+    sMembers: jest.fn(),
+  };
+  return { getRedisClient: jest.fn(() => mClient) };
+});
 const store: Record<string, string> = {};
 const queueStore: Record<string, string[]> = {};
 
@@ -486,6 +500,61 @@ describe('TaskQueue Tests', () => {
       expect(savedTask.status).toBe('queued');
       expect(savedTask.workerId).toBeUndefined();
       expect(mockRedisClient.zAdd).toHaveBeenCalledWith('queue:default', expect.any(Object));
+    });
+  });
+
+  describe('Task Grouping (Issue #26)', () => {
+    it('should allow task creation with groupId and index it in Redis', async () => {
+      redisClient.zCard.mockResolvedValue(0);
+      redisClient.zAdd.mockResolvedValue(1);
+      redisClient.sAdd.mockResolvedValue(1);
+
+      const task = await TaskQueue.createTask('test-task', 'test-handler', {}, { groupId: 'g1' });
+
+      expect(task).toBeDefined();
+      expect(task.groupId).toBe('g1');
+      expect(redisClient.sAdd).toHaveBeenCalledWith('group:g1:tasks', task.id);
+    });
+
+    it('should retrieve all tasks in a group', async () => {
+      redisClient.sMembers.mockResolvedValue(['t1', 't2']);
+      redisClient.get.mockImplementation(async (key: string) => {
+        if (key === 'task:t1') return JSON.stringify({ id: 't1', name: 'Task 1', groupId: 'g1', status: 'completed' });
+        if (key === 'task:t2') return JSON.stringify({ id: 't2', name: 'Task 2', groupId: 'g1', status: 'pending' });
+        return null;
+      });
+
+      const tasks = await TaskQueue.getGroupTasks('g1');
+      expect(tasks.length).toBe(2);
+      expect(tasks[0].id).toBe('t1');
+      expect(tasks[1].id).toBe('t2');
+    });
+
+    it('should calculate group status metrics and aggregate results', async () => {
+      redisClient.sMembers.mockResolvedValue(['t1', 't2', 't3']);
+      redisClient.get.mockImplementation(async (key: string) => {
+        if (key === 'task:t1') return JSON.stringify({ id: 't1', name: 'T1', groupId: 'g1', status: 'completed', result: 'res1' });
+        if (key === 'task:t2') return JSON.stringify({ id: 't2', name: 'T2', groupId: 'g1', status: 'failed', error: 'err2' });
+        if (key === 'task:t3') return JSON.stringify({ id: 't3', name: 'T3', groupId: 'g1', status: 'processing' });
+        return null;
+      });
+
+      const status = await TaskQueue.getGroupStatus('g1');
+      expect(status).toBeDefined();
+      expect(status?.totalTasks).toBe(3);
+      expect(status?.completedTasks).toBe(1);
+      expect(status?.failedTasks).toBe(1);
+      expect(status?.processingTasks).toBe(1);
+      expect(status?.completionPercentage).toBeCloseTo(33.33, 1);
+      expect(status?.results).toEqual({
+        't1': 'res1'
+      });
+    });
+
+    it('should return null if the group does not exist or has no tasks', async () => {
+      redisClient.sMembers.mockResolvedValue([]);
+      const status = await TaskQueue.getGroupStatus('g-nonexistent');
+      expect(status).toBeNull();
     });
   });
 });
