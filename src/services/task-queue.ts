@@ -263,6 +263,40 @@ export class TaskQueue {
   }
 
   /**
+   * Fetch up to `batchSize` runnable tasks from a queue in priority order, for
+   * workers that process tasks in batches. Applies the same runnability rules
+   * as getNextTask (dependencies met, not scheduled for later).
+   */
+  static async getNextBatch(queueName: string, batchSize: number = 10): Promise<Task[]> {
+    if (batchSize < 1) {
+      return [];
+    }
+    const client = getRedisClient();
+    const queueKey = `${QUEUE_PREFIX}${queueName}`;
+    const taskIds = await client.zRange(queueKey, 0, -1, { REV: true });
+
+    const batch: Task[] = [];
+    for (const taskId of taskIds) {
+      if (batch.length >= batchSize) break;
+
+      const task = await this.getTask(taskId);
+      if (!task) continue;
+
+      if (task.dependencies.length > 0) {
+        const depsResolved = await this._checkDependencies(task.dependencies);
+        if (!depsResolved) continue;
+      }
+      if (task.scheduledFor && new Date(task.scheduledFor) > new Date()) {
+        continue;
+      }
+
+      batch.push(task);
+    }
+
+    return batch;
+  }
+
+  /**
    * Retry a failed task
    */
   static async retryTask(taskId: string): Promise<boolean> {

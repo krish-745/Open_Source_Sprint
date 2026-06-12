@@ -158,6 +158,28 @@ export class TaskExecutor {
   }
 
   /**
+   * Execute a batch of tasks on a worker.
+   *
+   * Tasks run concurrently; each goes through the normal single-task lifecycle,
+   * so one task failing does not abort the others (partial-batch failure
+   * handling). Returns a summary with per-batch performance metrics.
+   */
+  static async executeBatch(
+    workerId: string,
+    tasks: Task[]
+  ): Promise<{ total: number; succeeded: number; failed: number; durationMs: number }> {
+    const start = Date.now();
+    const results = await Promise.allSettled(tasks.map((task) => this.execute(workerId, task)));
+
+    const failed = results.filter((r) => r.status === 'rejected').length;
+    const succeeded = results.length - failed;
+    const durationMs = Date.now() - start;
+
+    logger.info({ workerId, total: tasks.length, succeeded, failed, durationMs }, 'Batch executed');
+    return { total: tasks.length, succeeded, failed, durationMs };
+  }
+
+  /**
    * Get all registered handlers
    */
   static getRegisteredHandlers(): string[] {
