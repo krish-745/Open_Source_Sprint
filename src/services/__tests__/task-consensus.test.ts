@@ -41,6 +41,7 @@ function makeFakeRedis() {
       sets.get(k)?.delete(m);
       return 1;
     }),
+    expire: jest.fn(async () => 1),
     zAdd: jest.fn(async (k: string, { score, value }: { score: number; value: string }) => {
       const z = zsets.get(k) ?? new Map<string, number>();
       z.set(value, score);

@@ -48,6 +48,7 @@ function makeFakeRedis() {
     }),
     sMembers: jest.fn(async (k: string) => Array.from(sets.get(k) ?? [])),
     sRem: jest.fn(async (k: string, m: string) => { sets.get(k)?.delete(m); return 1; }),
+    expire: jest.fn(async () => 1),
 
     // --- sorted set ---
     zAdd: jest.fn(async (k: string, { score, value }: { score: number; value: string }) => {

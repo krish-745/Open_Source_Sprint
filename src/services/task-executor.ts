@@ -1,4 +1,4 @@
-import logger from '../utils/logger';
+import logger, { withTrace } from '../utils/logger';
 import { Task, TaskStatus } from '../types';
 import { TaskQueue } from './task-queue';
 import { WorkerPool } from './worker-pool';
@@ -7,12 +7,16 @@ import { deliverCallback } from './task-callbacks';
 import { TaskHooks } from './task-hooks';
 
 export interface TaskExecutionContext {
+  taskId: string;
+  traceId?: string;
+  /** spanId of the parent task; pass this as `parentSpanId` when creating child tasks. */
+  parentSpanId?: string;
   /** Handlers can poll this to cooperatively stop work when cancelled. */
   isCancelled: () => boolean;
 }
 
 export interface TaskHandler {
-  (payload: Record<string, any>, context?: TaskExecutionContext): Promise<any>;
+  (payload: Record<string, any>, context: TaskExecutionContext): Promise<any>;
 }
 
 export class TaskExecutor {
@@ -109,6 +113,9 @@ export class TaskExecutor {
       try {
         // Execute with timeout, passing a cancellation-aware context.
         const context: TaskExecutionContext = {
+          taskId: task.id,
+          traceId: task.traceId,
+          parentSpanId: task.parentSpanId,
           isCancelled: () => this.isCancelled(task.id),
         };
         executionResult = await Promise.race([
@@ -286,11 +293,19 @@ export class TaskExecutor {
         cpu: 0,
       });
 
-
+      const tlog = task.traceId
+        ? withTrace({ trace_id: task.traceId, span_id: task.id, parent_span_id: task.parentSpanId })
+        : logger;
+      tlog.info({ taskId: task.id, duration: Date.now() - startTime }, 'Task completed successfully');
     } catch (error: any) {
       const duration = Date.now() - startTime;
       const errorMessage = error?.message || String(error);
       logger.error({ taskId: task.id, error: errorMessage, duration }, 'Task execution crashed unexpectedly');
+
+      const tlog = task.traceId
+        ? withTrace({ trace_id: task.traceId, span_id: task.id, parent_span_id: task.parentSpanId })
+        : logger;
+      tlog.error({ taskId: task.id, error: errorMessage, duration }, 'Task execution failed');
 
       // Attempt to retry the task; if retries are exhausted move it to DLQ.
       try {

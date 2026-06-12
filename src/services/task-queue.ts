@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import { WatchError } from 'redis';
 import { getRedisClient } from './redis';
-import logger from '../utils/logger';
+import logger, { withTrace } from '../utils/logger';
 import { Task, TaskStatus, Queue, RecurrenceRule, ConsensusOptions, TaskBranch } from '../types';
 
 const TASK_PREFIX = 'task:';
@@ -9,6 +9,9 @@ const QUEUE_PREFIX = 'queue:';
 const QUEUE_LIST_KEY = 'queues:all';
 const TASK_INDEX_KEY = 'tasks:index';
 const DEAD_LETTER_QUEUE = 'dlq:tasks';
+/** TTL (seconds) for trace-index Redis sets — matches 7-day task retention. */
+const TRACE_INDEX_TTL_SECONDS = 7 * 24 * 60 * 60;
+
 const TASK_STATUS_INDEX_PREFIX = 'tasks:status:';
 const TASK_QUEUE_STATUS_INDEX_PREFIX = 'tasks:queue:';
 
@@ -74,6 +77,8 @@ export class TaskQueue {
       recurrence?: RecurrenceRule;
       tags?: string[];
       metadata?: Record<string, any>;
+      traceId?: string;
+      parentSpanId?: string;
       consensus?: ConsensusOptions;
     } = {}
   ): Promise<Task> {
@@ -98,6 +103,26 @@ export class TaskQueue {
 
     if (currentSize >= maxQueueSize) {
       throw new QueueFullError(queueName, maxQueueSize);
+    }
+
+    let traceId = options.traceId;
+    let parentSpanId = options.parentSpanId;
+    if (options.dependencies && options.dependencies.length > 0) {
+      // Inherit trace context from the first dependency so the whole chain
+      // shares a single traceId and we can reconstruct the call tree.
+      const depTask = await this.getTask(options.dependencies[0]);
+      if (depTask) {
+        if (!traceId && depTask.traceId) {
+          traceId = depTask.traceId;
+        }
+        if (!parentSpanId) {
+          // The dependency task IS the parent span.
+          parentSpanId = depTask.id;
+        }
+      }
+    }
+    if (!traceId) {
+      traceId = uuidv4();
     }
 
     // Use ?? (not ||) so that an explicit cost of 0 is honoured as a free task.
@@ -134,6 +159,8 @@ export class TaskQueue {
       recurrence: options.recurrence,
       tags: options.tags || [],
       metadata: options.metadata || {},
+      traceId,
+      ...(parentSpanId ? { parentSpanId } : {}),
       consensus: options.consensus,
     };
 
@@ -159,6 +186,11 @@ export class TaskQueue {
     // Add to secondary indices (status and queue+status)
     await this._updateTaskIndices(taskId, queueName, timestamp, task.status);
 
+    // Add to trace index (with TTL so sets don't accumulate indefinitely).
+    const traceKey = `trace:${traceId}`;
+    await client.sAdd(traceKey, taskId);
+    await client.expire(traceKey, TRACE_INDEX_TTL_SECONDS);
+
     // Add to queue
     const score = this._calculateQueueScore(task.priority);
     await client.zAdd(queueKey, { score, value: taskId });
@@ -175,7 +207,8 @@ export class TaskQueue {
       }
     }
 
-    logger.info({ taskId, queueName }, 'Task created');
+    withTrace({ trace_id: traceId, span_id: taskId, parent_span_id: parentSpanId })
+      .info({ taskId, queueName }, 'Task created');
     return task;
   }
 
@@ -365,9 +398,15 @@ export class TaskQueue {
           if (previousStatus !== status) {
             await this._transitionQueueStats(task.queue, previousStatus, status);
           }
+
+          if (task.traceId) {
+            withTrace({ trace_id: task.traceId, span_id: taskId, parent_span_id: task.parentSpanId })
+              .info({ taskId, status }, 'Task status updated');
+          } else {
+            logger.info({ taskId, status }, 'Task status updated');
+          }
         });
 
-        logger.info({ taskId, status }, 'Task status updated');
         return;
       } catch (error) {
         if (error instanceof WatchError || (error as Error).message.includes('watched keys has been changed')) {
@@ -530,7 +569,12 @@ export class TaskQueue {
     await client.hDel(`${queueKey}:dispatch`, taskId);
     await client.del(`task:${taskId}:consensus`);
 
-    logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
+    if (task.traceId) {
+      withTrace({ trace_id: task.traceId, span_id: taskId, parent_span_id: task.parentSpanId })
+        .info({ taskId, attempt: task.retries }, 'Task retry queued');
+    } else {
+      logger.info({ taskId, attempt: task.retries }, 'Task retry queued');
+    }
     return true;
   }
 
@@ -681,6 +725,22 @@ export class TaskQueue {
       LIMIT: { offset, count: limit }
     });
     return this._fetchTasksByIds(taskIds);
+  }
+
+  /**
+   * Get all tasks by trace ID
+   */
+  static async getTasksByTraceId(traceId: string): Promise<Task[]> {
+    const client = getRedisClient();
+    const taskIds = await client.sMembers(`trace:${traceId}`);
+    const tasks: Task[] = [];
+
+    for (const taskId of taskIds) {
+      const task = await this.getTask(taskId);
+      if (task) tasks.push(task);
+    }
+
+    return tasks;
   }
 
   /**

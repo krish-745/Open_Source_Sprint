@@ -29,6 +29,8 @@ export interface Task {
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
+  traceId?: string;      // Propagated through the full dependency chain
+  parentSpanId?: string; // spanId of the direct dependency task, for call-tree reconstruction
   consensus?: ConsensusOptions;
 }
 
