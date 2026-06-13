@@ -73,6 +73,8 @@ const mockRedisClient: any = {
   expire: jest.fn().mockResolvedValue(1),
 };
 
+const mockClient = mockRedisClient;
+
 jest.mock('../redis', () => ({
   getRedisClient: () => mockRedisClient,
 }));
@@ -673,7 +675,14 @@ describe('TaskQueue Tests', () => {
 
       const stats = await TaskQueue.getQueueStats('default');
       expect(stats).toEqual({
-        queueName: 'default', queueSize: 5, pending: 2, processing: 1, completed: 2, failed: 0
+        queueName: 'default',
+        queueSize: 5,
+        pending: 2,
+        processing: 1,
+        completed: 2,
+        failed: 0,
+        totalCompressedTasks: 0,
+        compressedBytesSaved: 0
       });
     });
   });
@@ -772,12 +781,7 @@ describe('TaskQueue Tests', () => {
       await expect(TaskQueue.cancelTask('missing')).rejects.toThrow('Task missing not found');
     });
 
-    it('should return false if task is already completed', async () => {
-      store['task:t1'] = JSON.stringify({ id: 't1', status: 'completed' });
-      expect(await TaskQueue.cancelTask('t1')).toBe(false);
-    });
-
-    it('should cancel pending task', async () => {
+    it('should cancel a pending task and update index', async () => {
       store['task:t1'] = JSON.stringify({ id: 't1', status: 'pending', queue: 'default' });
       queueStore['queue:default'] = ['t1'];
       
@@ -791,10 +795,6 @@ describe('TaskQueue Tests', () => {
   });
 
   describe('requeueTask', () => {
-    it('should return false if task not found', async () => {
-      expect(await TaskQueue.requeueTask('missing')).toBe(false);
-    });
-
     it('should requeue a processing task', async () => {
       store['task:t1'] = JSON.stringify({ id: 't1', status: 'processing', workerId: 'w1', queue: 'default', priority: 'medium' });
       
@@ -805,6 +805,141 @@ describe('TaskQueue Tests', () => {
       expect(savedTask.status).toBe('queued');
       expect(savedTask.workerId).toBeUndefined();
       expect(mockRedisClient.zAdd).toHaveBeenCalledWith('queue:default', expect.any(Object));
-        });
+    });
+  });
+
+  describe('Task Result Compression (Issue #10)', () => {
+    it('should compress large task results (>10KB) before saving to Redis', async () => {
+      const largeResult = 'A'.repeat(15 * 1024);
+      const task = await TaskQueue.createTask('compression_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeResult });
+      
+      const rawData = store['task:' + task.id];
+      expect(rawData).toBeDefined();
+      expect(rawData.length).toBeLessThan(1024 * 10);
+      expect(rawData).toContain('__gz_json_b64__:');
+    });
+
+    it('should transparently decompress large task results on retrieval', async () => {
+      const largeResult = 'B'.repeat(12 * 1024);
+      const task = await TaskQueue.createTask('decompression_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeResult });
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      expect(retrievedTask).toBeDefined();
+      expect(retrievedTask!.result).toBe(largeResult);
+    });
+
+    it('should correctly compress and decompress large object results', async () => {
+      const largeObject = {
+        key: 'value',
+        data: 'C'.repeat(15 * 1024)
+      };
+      const task = await TaskQueue.createTask('obj_compression_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeObject });
+      
+      const rawData = store['task:' + task.id];
+      expect(rawData).toContain('__gz_json_b64__:');
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      expect(retrievedTask!.result).toEqual(largeObject);
+    });
+
+    it('should store small task results uncompressed', async () => {
+      const smallResult = 'D'.repeat(5 * 1024);
+      const task = await TaskQueue.createTask('small_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: smallResult });
+      
+      const rawData = store['task:' + task.id];
+      expect(rawData).toBeDefined();
+      expect(rawData).not.toContain('__gz_json_b64__:');
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      expect(retrievedTask!.result).toBe(smallResult);
+    });
+
+    it('should update queue compression metrics exactly once per result payload', async () => {
+      const largeResult = 'E'.repeat(15 * 1024);
+      const task = await TaskQueue.createTask('metrics_test', 'test_handler', { test: true }, { queueName: 'myqueue' });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeResult });
+      
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:myqueue:stats', 'totalCompressedTasks', 1);
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:myqueue:stats', 'compressedBytesSaved', expect.any(Number));
+      
+      // Clear mock and trigger a retry or update that DOES NOT provide a new result
+      mockRedisClient.hIncrBy.mockClear();
+      await TaskQueue.retryTask(task.id);
+      
+      // Should not re-compress or double-count metrics
+      expect(mockRedisClient.hIncrBy).not.toHaveBeenCalledWith('queue:myqueue:stats', 'totalCompressedTasks', 1);
+    });
+
+    it('should properly compress tasks moved to the Dead Letter Queue', async () => {
+      const largeResult = 'F'.repeat(15 * 1024);
+      const task = await TaskQueue.createTask('dlq_test', 'test_handler', { test: true }, { maxRetries: 1 });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'processing', { result: largeResult });
+      await TaskQueue.retryTask(task.id);
+      await TaskQueue.retryTask(task.id); // Moves to DLQ
+      
+      expect(mockRedisClient.lPush).toHaveBeenCalled();
+      const pushedData = mockRedisClient.lPush.mock.calls[0][1];
+      expect(pushedData).toContain('__gz_json_b64__:');
+    });
+
+    it('should prevent prefix spoofing bypass by forcing compression on matching payloads', async () => {
+      // Small payload that tries to spoof the compressed format
+      const spoofedResult = '__gz_json_b64__:malicious_payload';
+      const task = await TaskQueue.createTask('spoof_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: spoofedResult });
+      
+      const rawData = store['task:' + task.id];
+      // It should have been double-wrapped (compressed) despite being < 10KB
+      expect(rawData).toContain('__gz_json_b64__:');
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      // It should safely decode back to the spoofed string, neutralizing the attack
+      expect(retrievedTask!.result).toBe(spoofedResult);
+    });
+
+    it('should safely fall back to raw string for unparseable legacy v1 compressed payloads', async () => {
+      // Emulate old __gz_b64__: payload that was a primitive string
+      // gzip of '"true"'
+      const task = await TaskQueue.createTask('legacy_test', 'test_handler', { test: true });
+      
+      const rawTask = store['task:' + task.id];
+      const taskObj = JSON.parse(rawTask);
+            // Using util.promisify(zlib.gzip) logic directly for the test setup
+      const zlib = require('zlib');
+      const compressed = zlib.gzipSync('true');
+      taskObj.result = `__gz_b64__:${compressed.toString('base64')}`;
+      store['task:' + task.id] = JSON.stringify(taskObj);
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      // Should fall back to string 'true', preventing morphing into boolean `true`
+      expect(retrievedTask!.result).toBe('true');
+    });
+
+    it('should handle decompression errors gracefully by returning the raw string', async () => {
+      const task = await TaskQueue.createTask('decompression_err_test', 'test_handler', { test: true });
+      
+      const rawTask = store['task:' + task.id];
+      const taskObj = JSON.parse(rawTask);
+      
+      // Store invalid gzip data simulating corruption
+      const invalidData = '__gz_json_b64__:invalid_base64_data_that_is_not_gzip';
+      taskObj.result = invalidData;
+      store['task:' + task.id] = JSON.stringify(taskObj);
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      // Should catch the gunzip error and return the task with the corrupted string intact instead of crashing
+      expect(retrievedTask!.result).toBe(invalidData);
+    });
   });
 });

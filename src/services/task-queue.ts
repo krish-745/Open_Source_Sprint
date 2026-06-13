@@ -4,6 +4,12 @@ import { getRedisClient } from './redis';
 import logger, { withTrace } from '../utils/logger';
 import { Task, TaskStatus, Queue, RecurrenceRule, ConsensusOptions, TaskBranch } from '../types';
 
+import * as zlib from 'zlib';
+import { promisify } from 'util';
+
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
+
 const TASK_PREFIX = 'task:';
 const QUEUE_PREFIX = 'queue:';
 const QUEUE_LIST_KEY = 'queues:all';
@@ -110,7 +116,7 @@ export class TaskQueue {
     if (options.dependencies && options.dependencies.length > 0) {
       // Inherit trace context from the first dependency so the whole chain
       // shares a single traceId and we can reconstruct the call tree.
-      const depTask = await this.getTask(options.dependencies[0]);
+      const depTask = await this._getRawTask(options.dependencies[0]);
       if (depTask) {
         if (!traceId && depTask.traceId) {
           traceId = depTask.traceId;
@@ -267,12 +273,21 @@ export class TaskQueue {
   }
 
   /**
-   * Get task by ID
+   * Get raw task by ID without decompressing result
    */
-  static async getTask(taskId: string): Promise<Task | null> {
+  private static async _getRawTask(taskId: string): Promise<Task | null> {
     const client = getRedisClient();
     const data = await client.get(`${TASK_PREFIX}${taskId}`);
     return data ? JSON.parse(data) : null;
+  }
+
+  /**
+   * Get task by ID (transparently decompresses)
+   */
+  static async getTask(taskId: string): Promise<Task | null> {
+    const task = await this._getRawTask(taskId);
+    if (!task) return null;
+    return await this._decompressTask(task);
   }
 
   /**
@@ -295,7 +310,7 @@ export class TaskQueue {
     }
   ): Promise<Task> {
     const client = getRedisClient();
-    const task = await this.getTask(taskId);
+    const task = await this._getRawTask(taskId);
 
     if (!task) {
       throw new Error(`Task ${taskId} not found`);
@@ -370,7 +385,11 @@ export class TaskQueue {
 
           task.status = status;
           if (metadata) {
-            Object.assign(task, metadata);
+            const metaCopy = { ...metadata };
+            if (metaCopy.result !== undefined) {
+              metaCopy.result = await this._compressPayload(metaCopy.result, task.queue, taskId);
+            }
+            Object.assign(task, metaCopy);
           }
           if (status === 'completed') {
             task.completedAt = new Date();
@@ -536,7 +555,7 @@ export class TaskQueue {
    */
   static async retryTask(taskId: string): Promise<boolean> {
     const client = getRedisClient();
-    const task = await this.getTask(taskId);
+    const task = await this._getRawTask(taskId);
 
     if (!task) {
       throw new Error(`Task ${taskId} not found`);
@@ -584,7 +603,7 @@ export class TaskQueue {
    */
   static async cancelTask(taskId: string): Promise<boolean> {
     const client = getRedisClient();
-    const task = await this.getTask(taskId);
+    const task = await this._getRawTask(taskId);
 
     if (!task) {
       throw new Error(`Task ${taskId} not found`);
@@ -761,6 +780,8 @@ export class TaskQueue {
       processing: parseInt(stats.processing || '0'),
       completed: parseInt(stats.completed || '0'),
       failed: parseInt(stats.failed || '0'),
+      totalCompressedTasks: parseInt(stats.totalCompressedTasks || '0'),
+      compressedBytesSaved: parseInt(stats.compressedBytesSaved || '0'),
     };
   }
 
@@ -773,9 +794,8 @@ export class TaskQueue {
 
     const allTaskIds = await client.zRange(TASK_INDEX_KEY, cutoffTime, 0, { BY: 'SCORE', REV: true });
     let deleted = 0;
-
     for (const taskId of allTaskIds) {
-      const task = await this.getTask(taskId);
+      const task = await this._getRawTask(taskId);
       if (task && (task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled')) {
         await client.del(`${TASK_PREFIX}${taskId}`);
         await client.zRem(TASK_INDEX_KEY, taskId);
@@ -816,7 +836,7 @@ export class TaskQueue {
     let expired = 0;
 
     for (const taskId of taskIds) {
-      const task = await this.getTask(taskId);
+      const task = await this._getRawTask(taskId);
       if (!task || !this.isExpired(task, now)) {
         continue;
       }
@@ -890,7 +910,7 @@ export class TaskQueue {
    */
   static async requeueTask(taskId: string): Promise<boolean> {
     const client = getRedisClient();
-    const task = await this.getTask(taskId);
+    const task = await this._getRawTask(taskId);
     if (!task) {
       return false;
     }
@@ -931,7 +951,7 @@ export class TaskQueue {
     let recovered = 0;
 
     for (const taskId of taskIds) {
-      const task = await this.getTask(taskId);
+      const task = await this._getRawTask(taskId);
       if (!task || task.status !== 'processing') {
         continue;
       }
@@ -1028,9 +1048,11 @@ export class TaskQueue {
     // Use mGet to fetch all task payloads in one round-trip
     const payloads = await client.mGet(keys);
     
-    return payloads
+    const tasks = payloads
       .filter((data): data is string => data !== null)
       .map(data => JSON.parse(data) as Task);
+      
+    return Promise.all(tasks.map(task => this._decompressTask(task)));
   }
 
   /**
@@ -1099,7 +1121,7 @@ export class TaskQueue {
       inStack.add(node);
       path.push(node);
 
-      const deps = node === rootId ? rootDeps : (await this.getTask(node))?.dependencies ?? [];
+      const deps = node === rootId ? rootDeps : (await this._getRawTask(node))?.dependencies ?? [];
       for (const dep of deps) {
         const cycle = await dfs(dep);
         if (cycle) {
@@ -1137,7 +1159,7 @@ export class TaskQueue {
 
   private static async _moveToDeadLetterQueue(taskId: string): Promise<void> {
     const client = getRedisClient();
-    const task = await this.getTask(taskId);
+    const task = await this._getRawTask(taskId);
 
     if (task) {
       const previousStatus = task.status;
@@ -1185,5 +1207,78 @@ export class TaskQueue {
     if (this.STATS_BUCKETS.includes(to)) {
       await client.hIncrBy(statsKey, to, 1);
     }
+  }
+  private static async _compressPayload(result: any, queueName: string, taskId: string): Promise<any> {
+    if (result === undefined || result === null) return result;
+
+    const resultString = JSON.stringify(result);
+    const originalByteLength = Buffer.byteLength(resultString, 'utf8');
+
+    // Force compression if the user payload looks like our internal prefixes to prevent spoofing bypass
+    const isSpoofed = typeof result === 'string' && (result.startsWith('__gz_json_b64__:') || result.startsWith('__gz_b64__:'));
+
+    if (originalByteLength > 10 * 1024 || isSpoofed) { // > 10KB
+      try {
+        const compressed = await gzip(resultString);
+        
+        const ratio = ((compressed.length / originalByteLength) * 100).toFixed(2);
+        logger.info({ 
+          taskId, 
+          originalSize: originalByteLength, 
+          compressedSize: compressed.length, 
+          ratio: `${ratio}%` 
+        }, 'Task result compressed');
+
+        const client = getRedisClient();
+        const statsKey = `${QUEUE_PREFIX}${queueName}:stats`;
+        await client.hIncrBy(statsKey, 'totalCompressedTasks', 1);
+        await client.hIncrBy(statsKey, 'compressedBytesSaved', originalByteLength - compressed.length);
+
+        return `__gz_json_b64__:${compressed.toString('base64')}`;
+      } catch (err) {
+        logger.error({ taskId, error: err }, 'Failed to compress task result');
+      }
+    }
+    
+    return result;
+  }
+
+  private static async _decompressTask(task: Task): Promise<Task> {
+    if (task.result && typeof task.result === 'string') {
+      try {
+        if (task.result.startsWith('__gz_json_b64__:')) {
+          const base64Data = task.result.substring('__gz_json_b64__:'.length);
+          const compressed = Buffer.from(base64Data, 'base64');
+          // Apply maxOutputLength to prevent zip bomb memory exhaustion
+          const decompressed = await gunzip(compressed, { maxOutputLength: 50 * 1024 * 1024 });
+          return {
+            ...task,
+            result: JSON.parse(decompressed.toString('utf-8'))
+          };
+        } else if (task.result.startsWith('__gz_b64__:')) {
+          const base64Data = task.result.substring('__gz_b64__:'.length);
+          const compressed = Buffer.from(base64Data, 'base64');
+          const decompressed = await gunzip(compressed, { maxOutputLength: 50 * 1024 * 1024 });
+          const decompressedString = decompressed.toString('utf-8');
+          
+          let parsedResult = decompressedString;
+          try {
+            const parsed = JSON.parse(decompressedString);
+            if (typeof parsed === 'object' && parsed !== null) {
+              parsedResult = parsed;
+            }
+          } catch (e) {
+            // Primitive or unparseable fallback -> retain as raw string to avoid morphing
+          }
+          return {
+            ...task,
+            result: parsedResult
+          };
+        }
+      } catch (err) {
+        logger.error({ taskId: task.id, error: err }, 'Failed to decompress task result');
+      }
+    }
+    return task;
   }
 }
