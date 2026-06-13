@@ -681,6 +681,7 @@ describe('TaskQueue Tests', () => {
         processing: 1,
         completed: 2,
         failed: 0,
+        rateLimitViolations: 0,
         totalCompressedTasks: 0,
         compressedBytesSaved: 0
       });

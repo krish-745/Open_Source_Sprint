@@ -23,7 +23,7 @@ describe('Task System E2E Tests', () => {
   beforeAll(async () => {
     await initializeRedis(
       process.env.REDIS_URL ||
-        'redis://localhost:6379'
+        'redis://localhost:6379/1'
     );
 
     TaskExecutor.registerHandler(

@@ -4,6 +4,7 @@ import logger from '../utils/logger';
 import { TaskQueue } from './task-queue';
 import { Worker, WorkerStatus, Task, TaskExecutionMetrics } from '../types';
 
+
 const WORKER_PREFIX = 'worker:';
 const WORKERS_INDEX = 'workers:index';
 const WORKER_HANDLERS = 'worker:handlers:map';
@@ -144,6 +145,11 @@ export class WorkerPool {
 
     if (!worker) {
       throw new Error(`Worker ${workerId} not found`);
+    }
+
+    const allowed = await TaskQueue.consumeRateLimitToken(task.queue, workerId);
+    if (!allowed) {
+      throw new Error(`Rate limit exceeded for worker ${workerId} on queue ${task.queue}`);
     }
 
     worker.currentTasks++;

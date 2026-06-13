@@ -89,6 +89,8 @@ function makeFakeRedis() {
       const l = lists.get(k) ?? [];
       return stop === -1 ? l.slice(start) : l.slice(start, stop + 1);
     }),
+    zCard: jest.fn(async (k: string) => zsets.get(k)?.size ?? 0),
+    eval: jest.fn(async () => 1),
     __strings: strings,
   } as any;
 }

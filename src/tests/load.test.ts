@@ -30,7 +30,7 @@ describe('System Load Test', () => {
 
     beforeAll(async () => {
         await initializeRedis(
-            process.env.REDIS_URL || 'redis://localhost:6379'
+            process.env.REDIS_URL || 'redis://localhost:6379/2'
         );
 
         TaskExecutor.registerHandler(
