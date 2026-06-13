@@ -1,71 +1,544 @@
-import { TaskQueue } from '../task-queue';
+import { TaskQueue, QueueFullError } from '../task-queue';
 import { getRedisClient } from '../redis';
+import { Task } from '../../types';
 
-jest.mock('../redis', () => {
-  const mClient = {
-    get: jest.fn(),
-    set: jest.fn(),
-    zAdd: jest.fn(),
-    zCard: jest.fn(),
-    hIncrBy: jest.fn(),
-    lPush: jest.fn(),
-    del: jest.fn(),
-  };
-  return { getRedisClient: jest.fn(() => mClient) };
-});
+const store: Record<string, string> = {};
+const queueStore: Record<string, string[]> = {};
+let taskIdsIndex: string[] = [];
 
-describe('TaskQueue', () => {
-  let redisClient: any;
+const mockRedisClient: any = {
+  watch: jest.fn().mockResolvedValue('OK'),
+  unwatch: jest.fn().mockResolvedValue('OK'),
+  executeIsolated: jest.fn().mockImplementation(async (callback: any) => {
+    return callback(mockRedisClient);
+  }),
+  multi: jest.fn().mockImplementation(() => {
+    const m: any = {
+      set: jest.fn().mockImplementation((key: string, value: string) => {
+        store[key] = value;
+        return m;
+      }),
+      zAdd: jest.fn().mockReturnThis(),
+      zRem: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue([['OK']]),
+    };
+    return m;
+  }),
+  get: jest.fn().mockImplementation(async (key: string) => store[key] || null),
+  set: jest.fn().mockImplementation(async (key: string, value: string) => {
+    store[key] = value;
+    return 'OK';
+  }),
+  zAdd: jest.fn().mockImplementation(async (key: string, item: { score: number; value: string }) => {
+    if (!queueStore[key]) {
+      queueStore[key] = [];
+    }
+    queueStore[key] = queueStore[key].filter(v => v !== item.value);
+    queueStore[key].push(item.value);
+    return 1;
+  }),
+  zCard: jest.fn().mockImplementation(async (key: string) => {
+    return (queueStore[key] || []).length;
+  }),
+  zRange: jest.fn().mockImplementation(async (key: string, start: number, stop: number, options?: any) => {
+    if (key === 'tasks:index') {
+      return taskIdsIndex;
+    }
+    const list = queueStore[key] || [];
+    if (start === 0 && stop === -1) {
+      return list;
+    }
+    const end = stop < 0 ? list.length : stop + 1;
+    return list.slice(start, end);
+  }),
+  hIncrBy: jest.fn().mockResolvedValue(1),
+  hSet: jest.fn().mockResolvedValue(1),
+  hGet: jest.fn().mockResolvedValue(null),
+  hDel: jest.fn().mockResolvedValue(1),
+  mGet: jest.fn().mockImplementation(async (keys: string[]) => keys.map((k: string) => store[k] || null)),
+  lPush: jest.fn().mockResolvedValue(1),
+  del: jest.fn().mockImplementation(async (key: string) => {
+    delete store[key];
+    return 1;
+  }),
+  zRem: jest.fn().mockImplementation(async (key: string, value: string) => {
+    if (queueStore[key]) {
+      queueStore[key] = queueStore[key].filter(v => v !== value);
+    }
+    return 1;
+  }),
+  hGetAll: jest.fn().mockResolvedValue({}),
+  sAdd: jest.fn().mockResolvedValue(1),
+  sMembers: jest.fn().mockResolvedValue([]),
+  expire: jest.fn().mockResolvedValue(1),
+};
 
+const mockClient = mockRedisClient;
+
+jest.mock('../redis', () => ({
+  getRedisClient: () => mockRedisClient,
+}));
+
+describe('TaskQueue Tests', () => {
   beforeEach(() => {
-    redisClient = getRedisClient();
+    for (const key in store) delete store[key];
+    for (const key in queueStore) delete queueStore[key];
+    taskIdsIndex = [];
     jest.clearAllMocks();
+  });
+
+  describe('searchTasks', () => {
+    const createTaskMock = (id: string, name: string, description: string): Task => {
+      return {
+        id,
+        name,
+        description,
+        priority: 'medium',
+        status: 'pending',
+        handler: 'testHandler',
+        payload: {},
+        retries: 0,
+        maxRetries: 3,
+        timeout: 30000,
+        createdAt: new Date(),
+        queue: 'default',
+        dependencies: [],
+        tags: [],
+        metadata: {},
+      };
+    };
+
+    it('should return empty array when query is empty', async () => {
+      const results = await TaskQueue.searchTasks('');
+      expect(results).toEqual([]);
+    });
+
+    it('should find tasks by case-insensitive name and description and score them', async () => {
+      const task1 = createTaskMock('1', 'Report Generator', 'Generates weekly sales reports');
+      const task2 = createTaskMock('2', 'Email Dispatcher', 'Sends reports via email');
+      const task3 = createTaskMock('3', 'Database Backup', 'Backs up sales database');
+
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      store['task:3'] = JSON.stringify(task3);
+      taskIdsIndex = ['1', '2', '3'];
+
+      const results = await TaskQueue.searchTasks('report');
+      
+      expect(results.length).toBe(2);
+      expect(results[0].taskId).toBe('1');
+      expect(results[0].score).toBe(7);
+      expect(results[1].taskId).toBe('2');
+      expect(results[1].score).toBe(2);
+    });
+
+    it('should rank exact name match highest', async () => {
+      const task1 = createTaskMock('1', 'Backup', 'Backup description');
+      const task2 = createTaskMock('2', 'Database Backup Service', 'Database backup description');
+
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      taskIdsIndex = ['1', '2'];
+
+      const results = await TaskQueue.searchTasks('Backup');
+      expect(results.length).toBe(2);
+      expect(results[0].taskId).toBe('1'); // exact name match
+      expect(results[1].taskId).toBe('2'); // partial name match
+    });
+
+    it('should handle special characters safely without crashing', async () => {
+      const task = createTaskMock('1', 'Special $&* Task', 'Contains special chars');
+      store['task:1'] = JSON.stringify(task);
+      taskIdsIndex = ['1'];
+
+      const results = await TaskQueue.searchTasks('$&*');
+      expect(results.length).toBe(1);
+      expect(results[0].taskId).toBe('1');
+    });
+
+    it('should respect the limit parameter', async () => {
+      const task1 = createTaskMock('1', 'Report Generator 1', 'Desc');
+      const task2 = createTaskMock('2', 'Report Generator 2', 'Desc');
+
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      taskIdsIndex = ['1', '2'];
+
+      const results = await TaskQueue.searchTasks('Report', 1);
+      expect(results.length).toBe(1);
+    });
+  });
+
+  describe('getQueueTasks with filtering', () => {
+    const queueName = 'test-queue';
+    const queueKey = `queue:${queueName}`;
+
+    const createTaskMock = (id: string, overrides: Partial<Task>): Task => {
+      return {
+        id,
+        name: `Task ${id}`,
+        description: `Description ${id}`,
+        priority: 'medium',
+        status: 'pending',
+        handler: 'testHandler',
+        payload: {},
+        retries: 0,
+        maxRetries: 3,
+        timeout: 30000,
+        createdAt: new Date(),
+        queue: queueName,
+        dependencies: [],
+        tags: [],
+        metadata: {},
+        ...overrides,
+      };
+    };
+
+    it('should return all tasks when no filters are provided', async () => {
+      const task1 = createTaskMock('1', { status: 'pending' });
+      const task2 = createTaskMock('2', { status: 'processing' });
+      
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      queueStore[queueKey] = ['1', '2'];
+
+      const result = await TaskQueue.getQueueTasks(queueName);
+      expect(result.length).toBe(2);
+    });
+
+    it('should filter tasks by status', async () => {
+      const task1 = createTaskMock('1', { status: 'pending' });
+      const task2 = createTaskMock('2', { status: 'processing' });
+      const task3 = createTaskMock('3', { status: 'completed' });
+      
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      store['task:3'] = JSON.stringify(task3);
+      queueStore[queueKey] = ['1', '2', '3'];
+
+      const result = await TaskQueue.getQueueTasks(queueName, 10, 0, { status: 'processing' });
+      expect(result.length).toBe(1);
+      expect(result[0].id).toBe('2');
+
+      const resultMulti = await TaskQueue.getQueueTasks(queueName, 10, 0, { status: ['pending', 'completed'] });
+      expect(resultMulti.length).toBe(2);
+      expect(resultMulti.map(t => t.id)).toEqual(['1', '3']);
+    });
+
+    it('should filter tasks by priority', async () => {
+      const task1 = createTaskMock('1', { priority: 'low' });
+      const task2 = createTaskMock('2', { priority: 'high' });
+      
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      queueStore[queueKey] = ['1', '2'];
+
+      const result = await TaskQueue.getQueueTasks(queueName, 10, 0, { priority: 'high' });
+      expect(result.length).toBe(1);
+      expect(result[0].id).toBe('2');
+    });
+
+    it('should filter tasks by tags matching all required tags', async () => {
+      const task1 = createTaskMock('1', { tags: ['cpu', 'fast'] });
+      const task2 = createTaskMock('2', { tags: ['io', 'slow'] });
+      const task3 = createTaskMock('3', { tags: ['cpu', 'slow'] });
+      
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      store['task:3'] = JSON.stringify(task3);
+      queueStore[queueKey] = ['1', '2', '3'];
+
+      const resultSingle = await TaskQueue.getQueueTasks(queueName, 10, 0, { tags: 'cpu' });
+      expect(resultSingle.length).toBe(2);
+      expect(resultSingle.map(t => t.id)).toEqual(['1', '3']);
+
+      const resultMulti = await TaskQueue.getQueueTasks(queueName, 10, 0, { tags: ['cpu', 'slow'] });
+      expect(resultMulti.length).toBe(1);
+      expect(resultMulti[0].id).toBe('3');
+    });
+
+    it('should filter tasks by date range', async () => {
+      const date1 = new Date('2026-06-01T00:00:00Z');
+      const date2 = new Date('2026-06-05T00:00:00Z');
+      const date3 = new Date('2026-06-10T00:00:00Z');
+
+      const task1 = createTaskMock('1', { createdAt: date1 });
+      const task2 = createTaskMock('2', { createdAt: date2 });
+      const task3 = createTaskMock('3', { createdAt: date3 });
+      
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      store['task:3'] = JSON.stringify(task3);
+      queueStore[queueKey] = ['1', '2', '3'];
+
+      const result = await TaskQueue.getQueueTasks(queueName, 10, 0, {
+        startDate: new Date('2026-06-03T00:00:00Z'),
+        endDate: new Date('2026-06-07T00:00:00Z'),
+      });
+      expect(result.length).toBe(1);
+      expect(result[0].id).toBe('2');
+    });
+
+    it('should combine multiple filters with AND logic', async () => {
+      const task1 = createTaskMock('1', { status: 'pending', priority: 'high' });
+      const task2 = createTaskMock('2', { status: 'processing', priority: 'high' });
+      const task3 = createTaskMock('3', { status: 'pending', priority: 'low' });
+      
+      store['task:1'] = JSON.stringify(task1);
+      store['task:2'] = JSON.stringify(task2);
+      store['task:3'] = JSON.stringify(task3);
+      queueStore[queueKey] = ['1', '2', '3'];
+
+      const result = await TaskQueue.getQueueTasks(queueName, 10, 0, {
+        status: 'pending',
+        priority: 'high',
+      });
+      expect(result.length).toBe(1);
+      expect(result[0].id).toBe('1');
+    });
+  });
+
+  describe('createTask payload validation', () => {
+    it('should create a task with a valid object payload', async () => {
+      const payload = { key: 'value' };
+      const task = await TaskQueue.createTask('Test Task', 'testHandler', payload);
+      
+      expect(task).toBeDefined();
+      expect(task.payload).toEqual(payload);
+    });
+
+    it('should default null payload to an empty object', async () => {
+      const task = await TaskQueue.createTask('Test Task', 'testHandler', null as any);
+      
+      expect(task).toBeDefined();
+      expect(task.payload).toEqual({});
+    });
+
+    it('should default undefined payload to an empty object', async () => {
+      const task = await TaskQueue.createTask('Test Task', 'testHandler', undefined as any);
+      
+      expect(task).toBeDefined();
+      expect(task.payload).toEqual({});
+    });
+
+    it('should throw an error if payload is a string', async () => {
+      await expect(
+        TaskQueue.createTask('Test Task', 'testHandler', 'invalid-string' as any)
+      ).rejects.toThrow('Payload must be a valid object');
+    });
+
+    it('should throw an error if payload is an array', async () => {
+      await expect(
+        TaskQueue.createTask('Test Task', 'testHandler', [1, 2, 3] as any)
+      ).rejects.toThrow('Payload must be a valid object');
+    });
+
+    it('should throw an error if payload is a number', async () => {
+      await expect(
+        TaskQueue.createTask('Test Task', 'testHandler', 123 as any)
+      ).rejects.toThrow('Payload must be a valid object');
+    });
+  });
+
+  describe('createTask', () => {
+    it('should create a task with default options', async () => {
+      const task = await TaskQueue.createTask('test-task', 'test-handler', { foo: 'bar' });
+      expect(task).toBeDefined();
+      expect(task.name).toBe('test-task');
+      expect(task.handler).toBe('test-handler');
+      expect(task.payload).toEqual({ foo: 'bar' });
+      expect(task.queue).toBe('default');
+      expect(task.priority).toBe('medium');
+      expect(task.status).toBe('pending');
+      
+      expect(mockRedisClient.set).toHaveBeenCalledTimes(1);
+      expect(mockRedisClient.zAdd).toHaveBeenCalledTimes(2); // One for task index, one for queue
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:default:stats', 'pending', 1);
+    });
+
+    it('should create a task with custom options', async () => {
+      const scheduledFor = new Date();
+      const task = await TaskQueue.createTask('test-task', 'test-handler', {}, {
+        queueName: 'custom-queue',
+        priority: 'high',
+        maxRetries: 5,
+        timeout: 10000,
+        dependencies: ['dep-1'],
+        scheduledFor,
+        tags: ['tag1'],
+      });
+
+      expect(task.queue).toBe('custom-queue');
+      expect(task.priority).toBe('high');
+      expect(task.maxRetries).toBe(5);
+      expect(task.timeout).toBe(10000);
+      expect(task.dependencies).toEqual(['dep-1']);
+      expect(task.scheduledFor).toBe(scheduledFor);
+      expect(task.tags).toEqual(['tag1']);
+    });
+
+    it('should reject new tasks when queue size exceeds MAX_QUEUE_SIZE limit', async () => {
+      process.env.MAX_QUEUE_SIZE = '100';
+      mockRedisClient.zCard.mockResolvedValueOnce(100);
+      
+      await expect(
+        TaskQueue.createTask('test-task', 'test-handler', {})
+      ).rejects.toThrow(/Queue default exceeds maximum size of 100/i);
+    });
+
+    it('should allow task creation when queue size is below MAX_QUEUE_SIZE limit', async () => {
+      process.env.MAX_QUEUE_SIZE = '100';
+      mockRedisClient.zCard.mockResolvedValueOnce(99);
+
+      const task = await TaskQueue.createTask('test-task', 'test-handler', {});
+      expect(task).toBeDefined();
+      expect(task.name).toBe('test-task');
+    });
+  });
+
+  describe('createTasksBatch', () => {
+    it('should throw error if batch is empty', async () => {
+      await expect(TaskQueue.createTasksBatch([])).rejects.toThrow('Batch must contain at least one task');
+    });
+
+    it('should throw error if batch exceeds 1000 tasks', async () => {
+      const inputs = Array(1001).fill({ name: 'n', handler: 'h' });
+      await expect(TaskQueue.createTasksBatch(inputs)).rejects.toThrow('Batch size exceeds the maximum of 1000 tasks');
+    });
+
+    it('should throw error if any task is invalid', async () => {
+      const inputs = [{ name: 'task-1', handler: 'h' }, { name: '', handler: 'h' }];
+      await expect(TaskQueue.createTasksBatch(inputs)).rejects.toThrow('Invalid task at index 1: name and handler are required');
+    });
+
+    it('should create multiple tasks', async () => {
+      const inputs = [
+        { name: 'task-1', handler: 'handler-1', payload: { a: 1 } },
+        { name: 'task-2', handler: 'handler-2' }
+      ];
+      const tasks = await TaskQueue.createTasksBatch(inputs);
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0].name).toBe('task-1');
+      expect(tasks[1].name).toBe('task-2');
+      expect(mockRedisClient.set).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('getTask', () => {
+    it('should return task if it exists', async () => {
+      const mockTask = { id: 'task-1', name: 'test' };
+      store['task:task-1'] = JSON.stringify(mockTask);
+
+      const task = await TaskQueue.getTask('task-1');
+      expect(task).toEqual(mockTask);
+      expect(mockRedisClient.get).toHaveBeenCalledWith('task:task-1');
+    });
+
+    it('should return null if task does not exist', async () => {
+      const task = await TaskQueue.getTask('task-missing');
+      expect(task).toBeNull();
+    });
+  });
+
+  describe('updateTaskStatus', () => {
+    it('should throw error if task not found', async () => {
+      await expect(TaskQueue.updateTaskStatus('missing', 'completed')).rejects.toThrow('Task missing not found');
+    });
+
+    it('should update status to processing and set startedAt', async () => {
+      const mockTask = { id: 'task-1', status: 'pending', queue: 'default' };
+      store['task:task-1'] = JSON.stringify(mockTask);
+
+      await TaskQueue.updateTaskStatus('task-1', 'processing');
+
+      const savedTask = JSON.parse(store['task:task-1']);
+      expect(savedTask.status).toBe('processing');
+      expect(savedTask.startedAt).toBeDefined();
+
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:default:stats', 'pending', -1);
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:default:stats', 'processing', 1);
+    });
+
+    it('should update status to completed and set completedAt', async () => {
+      const mockTask = { id: 'task-1', status: 'processing', queue: 'default' };
+      store['task:task-1'] = JSON.stringify(mockTask);
+
+      await TaskQueue.updateTaskStatus('task-1', 'completed', { result: 'success' });
+
+      const savedTask = JSON.parse(store['task:task-1']);
+      expect(savedTask.status).toBe('completed');
+      expect(savedTask.completedAt).toBeDefined();
+      expect(savedTask.result).toBe('success');
+
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:default:stats', 'processing', -1);
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:default:stats', 'completed', 1);
+    });
+  });
+
+  describe('getNextTask', () => {
+    it('should return null if queue is empty', async () => {
+      const task = await TaskQueue.getNextTask('default');
+      expect(task).toBeNull();
+    });
+
+    it('should skip tasks with unmet dependencies', async () => {
+      const task1 = { id: 't1', dependencies: ['d1'] }; // d1 not found
+      queueStore['queue:default'] = ['t1'];
+      store['task:t1'] = JSON.stringify(task1);
+
+      const task = await TaskQueue.getNextTask('default');
+      expect(task).toBeNull();
+    });
+
+    it('should skip tasks scheduled for the future', async () => {
+      const futureDate = new Date();
+      futureDate.setHours(futureDate.getHours() + 1);
+      const task1 = { id: 't1', dependencies: [], scheduledFor: futureDate.toISOString() };
+      
+      queueStore['queue:default'] = ['t1'];
+      store['task:t1'] = JSON.stringify(task1);
+
+      const task = await TaskQueue.getNextTask('default');
+      expect(task).toBeNull();
+    });
+
+    it('should return first runnable task', async () => {
+      const task1 = { id: 't1', dependencies: [], status: 'pending' };
+      queueStore['queue:default'] = ['t1'];
+      store['task:t1'] = JSON.stringify(task1);
+
+      const task = await TaskQueue.getNextTask('default');
+      expect(task).toEqual(task1);
+    });
   });
 
   describe('retryTask (Fix #18)', () => {
     it('should strictly delete the error field, not set it to undefined', async () => {
       const mockTask = {
-        id: 'task-1',
-        name: 'failing-task',
-        status: 'failed',
-        retries: 0,
-        maxRetries: 3,
-        error: 'Connection timed out',
-        queue: 'default',
-        priority: 'medium',
+        id: 'task-1', name: 'failing-task', status: 'failed', retries: 0, maxRetries: 3,
+        error: 'Connection timed out', queue: 'default', priority: 'medium',
       };
 
-      redisClient.get.mockResolvedValue(JSON.stringify(mockTask));
+      store['task:task-1'] = JSON.stringify(mockTask);
 
       await TaskQueue.retryTask('task-1');
 
-      const setCall = redisClient.set.mock.calls[0];
-      expect(setCall).toBeDefined();
-
-      const savedTask = JSON.parse(setCall[1]);
-
-      // error must be completely absent from the serialized object
+      const savedTask = JSON.parse(store['task:task-1']);
       expect(Object.keys(savedTask)).not.toContain('error');
       expect(savedTask.error).toBeUndefined();
     });
 
     it('should increment retries and set status to retry', async () => {
       const mockTask = {
-        id: 'task-2',
-        name: 'failing-task',
-        status: 'failed',
-        retries: 1,
-        maxRetries: 3,
-        error: 'Handler crashed',
-        queue: 'default',
-        priority: 'high',
+        id: 'task-2', name: 'failing-task', status: 'failed', retries: 1, maxRetries: 3,
+        error: 'Handler crashed', queue: 'default', priority: 'high',
       };
 
-      redisClient.get.mockResolvedValue(JSON.stringify(mockTask));
+      store['task:task-2'] = JSON.stringify(mockTask);
 
       await TaskQueue.retryTask('task-2');
 
-      const savedTask = JSON.parse(redisClient.set.mock.calls[0][1]);
+      const savedTask = JSON.parse(store['task:task-2']);
       expect(savedTask.status).toBe('retry');
       expect(savedTask.retries).toBe(2);
     });
@@ -82,37 +555,392 @@ describe('TaskQueue', () => {
         priority: 'low',
       };
 
-      redisClient.get.mockResolvedValue(JSON.stringify(mockTask));
+      store['task:task-3'] = JSON.stringify(mockTask);
 
       const result = await TaskQueue.retryTask('task-3');
 
       expect(result).toBe(false);
-      expect(redisClient.set).not.toHaveBeenCalled();
+      expect(store['task:task-3']).toBeUndefined();
     });
   });
 
   describe('createTask (Fix #22)', () => {
     it('should reject new tasks when queue size exceeds MAX_QUEUE_SIZE limit', async () => {
-      // Configure max size to 100
       process.env.MAX_QUEUE_SIZE = '100';
-      
-      // Simulate queue already having 100 tasks
-      redisClient.zCard.mockResolvedValue(100);
+      const zCardSpy = jest.spyOn(mockRedisClient, 'zCard').mockResolvedValueOnce(100);
       
       await expect(
         TaskQueue.createTask('test-task', 'test-handler', {})
       ).rejects.toThrow(/Queue default exceeds maximum size of 100/i);
+
+      zCardSpy.mockRestore();
     });
 
     it('should allow task creation when queue size is below MAX_QUEUE_SIZE limit', async () => {
       process.env.MAX_QUEUE_SIZE = '100';
-      redisClient.zCard.mockResolvedValue(99);
-      redisClient.zAdd.mockResolvedValue(1); // Mock adding to set
-
+      const zCardSpy = jest.spyOn(mockRedisClient, 'zCard').mockResolvedValueOnce(99);
       const task = await TaskQueue.createTask('test-task', 'test-handler', {});
-      
       expect(task).toBeDefined();
-      expect(task.name).toBe('test-task');
+      zCardSpy.mockRestore();
+    });
+  });
+
+  describe('Distributed Tracing (Issue #39)', () => {
+    it('should generate a traceId when no traceId is provided and no dependencies', async () => {
+      const task = await TaskQueue.createTask('test-task', 'handler', {});
+
+      expect(task.traceId).toBeDefined();
+      expect(typeof task.traceId).toBe('string');
+      // No dependencies → no parentSpanId
+      expect(task.parentSpanId).toBeUndefined();
+      expect(mockRedisClient.sAdd).toHaveBeenCalledWith(`trace:${task.traceId}`, task.id);
+      // Trace index must be given a TTL so it doesn't accumulate forever
+      expect(mockRedisClient.expire).toHaveBeenCalledWith(`trace:${task.traceId}`, expect.any(Number));
+    });
+
+    it('should inherit traceId and set parentSpanId from the dependency task', async () => {
+      const depTask = {
+        id: 'dep-task-id',
+        status: 'completed',
+        traceId: 'trace-1234',
+      };
+
+      store['task:dep-task-id'] = JSON.stringify(depTask);
+
+      const task = await TaskQueue.createTask('child-task', 'handler', {}, {
+        dependencies: ['dep-task-id'],
+      });
+
+      // traceId flows down from the dependency
+      expect(task.traceId).toBe('trace-1234');
+      // parentSpanId points at the direct dependency, enabling call-tree reconstruction
+      expect(task.parentSpanId).toBe('dep-task-id');
+      expect(mockRedisClient.sAdd).toHaveBeenCalledWith('trace:trace-1234', task.id);
+      expect(mockRedisClient.expire).toHaveBeenCalledWith('trace:trace-1234', expect.any(Number));
+    });
+
+    it('should use an explicitly provided traceId and parentSpanId over auto-derived values', async () => {
+      const depTask = { id: 'dep-id', status: 'completed', traceId: 'trace-auto' };
+      store['task:dep-id'] = JSON.stringify(depTask);
+
+      const task = await TaskQueue.createTask('override-task', 'handler', {}, {
+        dependencies: ['dep-id'],
+        traceId: 'trace-explicit',
+        parentSpanId: 'custom-parent-span',
+      });
+
+      expect(task.traceId).toBe('trace-explicit');
+      expect(task.parentSpanId).toBe('custom-parent-span');
+    });
+
+    it('should query all tasks in a trace by traceId', async () => {
+      mockRedisClient.sMembers.mockResolvedValueOnce(['task-1', 'task-2']);
+      store['task:task-1'] = JSON.stringify({ id: 'task-1', traceId: 'trace-999' });
+      store['task:task-2'] = JSON.stringify({ id: 'task-2', traceId: 'trace-999' });
+
+      const tasks = await TaskQueue.getTasksByTraceId('trace-999');
+      expect(tasks).toHaveLength(2);
+      expect(tasks.map((t: any) => t.id)).toEqual(['task-1', 'task-2']);
+    });
+
+    it('should return empty array when traceId has no registered tasks', async () => {
+      mockRedisClient.sMembers.mockResolvedValueOnce([]);
+      const tasks = await TaskQueue.getTasksByTraceId('trace-no-match');
+      expect(tasks).toHaveLength(0);
+    });
+  });
+
+  describe('getQueueTasks', () => {
+    it('should return tasks for given queue', async () => {
+      queueStore['queue:default'] = ['t1', 't2'];
+      store['task:t1'] = JSON.stringify({ id: 't1' });
+      store['task:t2'] = JSON.stringify({ id: 't2' });
+
+      const taskIds = await mockRedisClient.zRange('queue:default', 0, 9);
+      const t1 = await mockRedisClient.get('task:t1');
+
+      const tasks = await TaskQueue.getQueueTasks('default', 10, 0);
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0].id).toBe('t1');
+      expect(tasks[1].id).toBe('t2');
+    });
+  });
+
+  describe('getQueueStats', () => {
+    it('should return queue statistics', async () => {
+      mockRedisClient.zCard.mockResolvedValueOnce(5);
+      mockRedisClient.hGetAll.mockResolvedValueOnce({
+        pending: '2', processing: '1', completed: '2', failed: '0'
+      });
+
+      const stats = await TaskQueue.getQueueStats('default');
+      expect(stats).toEqual({
+        queueName: 'default',
+        queueSize: 5,
+        pending: 2,
+        processing: 1,
+        completed: 2,
+        failed: 0,
+        rateLimitViolations: 0,
+        totalCompressedTasks: 0,
+        compressedBytesSaved: 0
+      });
+    });
+  });
+
+  describe('cleanupOldTasks', () => {
+    it('should delete old completed and failed tasks', async () => {
+      queueStore['tasks:index'] = ['t1', 't2', 't3'];
+      store['task:t1'] = JSON.stringify({ id: 't1', status: 'completed' });
+      store['task:t2'] = JSON.stringify({ id: 't2', status: 'pending' });
+      store['task:t3'] = JSON.stringify({ id: 't3', status: 'failed' });
+
+      mockRedisClient.zRange.mockResolvedValueOnce(['t1', 't2', 't3']);
+
+      const deleted = await TaskQueue.cleanupOldTasks(24);
+      expect(deleted).toBe(2);
+      expect(store['task:t1']).toBeUndefined();
+      expect(store['task:t3']).toBeUndefined();
+      expect(queueStore['tasks:index']).not.toContain('t1');
+      expect(queueStore['tasks:index']).not.toContain('t3');
+    });
+  });
+
+  describe('recoverStaleTasks', () => {
+    it('should recover processing tasks older than staleMs', async () => {
+      const oldTime = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      const recentTime = new Date().toISOString();
+
+      queueStore['tasks:index'] = ['t1', 't2'];
+      store['task:t1'] = JSON.stringify({ 
+        id: 't1', status: 'processing', startedAt: oldTime, workerId: 'w1', queue: 'default', priority: 'medium'
+      });
+      store['task:t2'] = JSON.stringify({ 
+        id: 't2', status: 'processing', startedAt: recentTime, workerId: 'w2' 
+      });
+
+      mockRedisClient.zRange.mockResolvedValueOnce(['t1', 't2']);
+
+      const recovered = await TaskQueue.recoverStaleTasks(5 * 60 * 1000);
+      
+      expect(recovered).toBe(1);
+      
+      const savedTask1 = JSON.parse(store['task:t1']);
+      expect(savedTask1.status).toBe('queued');
+      expect(savedTask1.workerId).toBeUndefined();
+      expect(mockRedisClient.zAdd).toHaveBeenCalledWith('queue:default', expect.any(Object));
+    });
+  });
+
+  describe('evaluateBranches', () => {
+    it('should return empty array if no branches', () => {
+      const task = { id: 't1', name: 't', handler: 'h', payload: {} } as any;
+      expect(TaskQueue.evaluateBranches(task, 'success')).toEqual([]);
+    });
+
+    it('should match substring condition', () => {
+      const task = { 
+        id: 't1', name: 't', handler: 'h', payload: {},
+        branches: [
+          { condition: 'success', taskName: 'next-t1', payloadTemplate: {} },
+          { condition: 'fail', taskName: 'next-t2', payloadTemplate: {} }
+        ]
+      } as any;
+      const branches = TaskQueue.evaluateBranches(task, 'operation success done');
+      expect(branches).toHaveLength(1);
+      expect(branches[0].condition).toBe('success');
+    });
+
+    it('should match regex condition', () => {
+      const task = { 
+        id: 't1', name: 't', handler: 'h', payload: {},
+        branches: [{ condition: 'regex:^\\d+$', taskName: 'next-t1', payloadTemplate: {} }]
+      } as any;
+      const branches = TaskQueue.evaluateBranches(task, '12345');
+      expect(branches).toHaveLength(1);
+    });
+  });
+
+  describe('getNextBatch', () => {
+    it('should return empty array if batchSize < 1', async () => {
+      expect(await TaskQueue.getNextBatch('default', 0)).toEqual([]);
+    });
+
+    it('should return batch of tasks', async () => {
+      queueStore['queue:default'] = ['t1', 't2'];
+      store['task:t1'] = JSON.stringify({ id: 't1', dependencies: [] });
+      store['task:t2'] = JSON.stringify({ id: 't2', dependencies: [] });
+
+      const batch = await TaskQueue.getNextBatch('default', 2);
+      expect(batch).toHaveLength(2);
+      expect(batch.map(t => t.id)).toEqual(['t1', 't2']);
+    });
+  });
+
+  describe('cancelTask', () => {
+    it('should throw error if task not found', async () => {
+      await expect(TaskQueue.cancelTask('missing')).rejects.toThrow('Task missing not found');
+    });
+
+    it('should cancel a pending task and update index', async () => {
+      store['task:t1'] = JSON.stringify({ id: 't1', status: 'pending', queue: 'default' });
+      queueStore['queue:default'] = ['t1'];
+      
+      const result = await TaskQueue.cancelTask('t1');
+      expect(result).toBe(true);
+      
+      const savedTask = JSON.parse(store['task:t1']);
+      expect(savedTask.status).toBe('cancelled');
+      expect(queueStore['queue:default']).not.toContain('t1');
+    });
+  });
+
+  describe('requeueTask', () => {
+    it('should requeue a processing task', async () => {
+      store['task:t1'] = JSON.stringify({ id: 't1', status: 'processing', workerId: 'w1', queue: 'default', priority: 'medium' });
+      
+      const result = await TaskQueue.requeueTask('t1');
+      expect(result).toBe(true);
+      
+      const savedTask = JSON.parse(store['task:t1']);
+      expect(savedTask.status).toBe('queued');
+      expect(savedTask.workerId).toBeUndefined();
+      expect(mockRedisClient.zAdd).toHaveBeenCalledWith('queue:default', expect.any(Object));
+    });
+  });
+
+  describe('Task Result Compression (Issue #10)', () => {
+    it('should compress large task results (>10KB) before saving to Redis', async () => {
+      const largeResult = 'A'.repeat(15 * 1024);
+      const task = await TaskQueue.createTask('compression_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeResult });
+      
+      const rawData = store['task:' + task.id];
+      expect(rawData).toBeDefined();
+      expect(rawData.length).toBeLessThan(1024 * 10);
+      expect(rawData).toContain('__gz_json_b64__:');
+    });
+
+    it('should transparently decompress large task results on retrieval', async () => {
+      const largeResult = 'B'.repeat(12 * 1024);
+      const task = await TaskQueue.createTask('decompression_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeResult });
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      expect(retrievedTask).toBeDefined();
+      expect(retrievedTask!.result).toBe(largeResult);
+    });
+
+    it('should correctly compress and decompress large object results', async () => {
+      const largeObject = {
+        key: 'value',
+        data: 'C'.repeat(15 * 1024)
+      };
+      const task = await TaskQueue.createTask('obj_compression_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeObject });
+      
+      const rawData = store['task:' + task.id];
+      expect(rawData).toContain('__gz_json_b64__:');
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      expect(retrievedTask!.result).toEqual(largeObject);
+    });
+
+    it('should store small task results uncompressed', async () => {
+      const smallResult = 'D'.repeat(5 * 1024);
+      const task = await TaskQueue.createTask('small_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: smallResult });
+      
+      const rawData = store['task:' + task.id];
+      expect(rawData).toBeDefined();
+      expect(rawData).not.toContain('__gz_json_b64__:');
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      expect(retrievedTask!.result).toBe(smallResult);
+    });
+
+    it('should update queue compression metrics exactly once per result payload', async () => {
+      const largeResult = 'E'.repeat(15 * 1024);
+      const task = await TaskQueue.createTask('metrics_test', 'test_handler', { test: true }, { queueName: 'myqueue' });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: largeResult });
+      
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:myqueue:stats', 'totalCompressedTasks', 1);
+      expect(mockRedisClient.hIncrBy).toHaveBeenCalledWith('queue:myqueue:stats', 'compressedBytesSaved', expect.any(Number));
+      
+      // Clear mock and trigger a retry or update that DOES NOT provide a new result
+      mockRedisClient.hIncrBy.mockClear();
+      await TaskQueue.retryTask(task.id);
+      
+      // Should not re-compress or double-count metrics
+      expect(mockRedisClient.hIncrBy).not.toHaveBeenCalledWith('queue:myqueue:stats', 'totalCompressedTasks', 1);
+    });
+
+    it('should properly compress tasks moved to the Dead Letter Queue', async () => {
+      const largeResult = 'F'.repeat(15 * 1024);
+      const task = await TaskQueue.createTask('dlq_test', 'test_handler', { test: true }, { maxRetries: 1 });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'processing', { result: largeResult });
+      await TaskQueue.retryTask(task.id);
+      await TaskQueue.retryTask(task.id); // Moves to DLQ
+      
+      expect(mockRedisClient.lPush).toHaveBeenCalled();
+      const pushedData = mockRedisClient.lPush.mock.calls[0][1];
+      expect(pushedData).toContain('__gz_json_b64__:');
+    });
+
+    it('should prevent prefix spoofing bypass by forcing compression on matching payloads', async () => {
+      // Small payload that tries to spoof the compressed format
+      const spoofedResult = '__gz_json_b64__:malicious_payload';
+      const task = await TaskQueue.createTask('spoof_test', 'test_handler', { test: true });
+      
+      await TaskQueue.updateTaskStatus(task.id, 'completed', { result: spoofedResult });
+      
+      const rawData = store['task:' + task.id];
+      // It should have been double-wrapped (compressed) despite being < 10KB
+      expect(rawData).toContain('__gz_json_b64__:');
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      // It should safely decode back to the spoofed string, neutralizing the attack
+      expect(retrievedTask!.result).toBe(spoofedResult);
+    });
+
+    it('should safely fall back to raw string for unparseable legacy v1 compressed payloads', async () => {
+      // Emulate old __gz_b64__: payload that was a primitive string
+      // gzip of '"true"'
+      const task = await TaskQueue.createTask('legacy_test', 'test_handler', { test: true });
+      
+      const rawTask = store['task:' + task.id];
+      const taskObj = JSON.parse(rawTask);
+            // Using util.promisify(zlib.gzip) logic directly for the test setup
+      const zlib = require('zlib');
+      const compressed = zlib.gzipSync('true');
+      taskObj.result = `__gz_b64__:${compressed.toString('base64')}`;
+      store['task:' + task.id] = JSON.stringify(taskObj);
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      // Should fall back to string 'true', preventing morphing into boolean `true`
+      expect(retrievedTask!.result).toBe('true');
+    });
+
+    it('should handle decompression errors gracefully by returning the raw string', async () => {
+      const task = await TaskQueue.createTask('decompression_err_test', 'test_handler', { test: true });
+      
+      const rawTask = store['task:' + task.id];
+      const taskObj = JSON.parse(rawTask);
+      
+      // Store invalid gzip data simulating corruption
+      const invalidData = '__gz_json_b64__:invalid_base64_data_that_is_not_gzip';
+      taskObj.result = invalidData;
+      store['task:' + task.id] = JSON.stringify(taskObj);
+      
+      const retrievedTask = await TaskQueue.getTask(task.id);
+      // Should catch the gunzip error and return the task with the corrupted string intact instead of crashing
+      expect(retrievedTask!.result).toBe(invalidData);
     });
   });
 });

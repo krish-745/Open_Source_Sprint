@@ -1,10 +1,11 @@
 import express, { Request, Response, NextFunction } from 'express';
-import { TaskQueue, QueueFullError } from '../services/task-queue';
+import { TaskQueue, DependencyCycleError, QueueFullError } from '../services/task-queue';
 import { WorkerPool } from '../services/worker-pool';
 import { TaskExecutor } from '../services/task-executor';
 import { TaskScheduler } from '../services/task-scheduler';
 import { MetricsCollector } from '../services/metrics-collector';
 import { getRedisStatus } from '../services/redis';
+import { TaskTemplates } from '../services/task-templates';
 import logger from '../utils/logger';
 
 const router = express.Router();
@@ -19,36 +20,103 @@ router.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
+// Template endpoints
+
+router.post('/templates', (req: Request, res: Response) => {
+  try {
+    const { name, handler, priority, defaults, requiredFields } = req.body;
+    if (!name || !handler) {
+      return res.status(400).json({ error: 'Template requires name and handler' });
+    }
+    const template = TaskTemplates.register({ name, handler, priority, defaults, requiredFields });
+    res.status(201).json(template);
+  } catch (error: any) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+router.get('/templates', (_req: Request, res: Response) => {
+  res.json(TaskTemplates.list());
+});
+
 // Task endpoints
 
 router.post('/tasks', async (req: Request, res: Response) => {
   try {
-    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags } = req.body;
+    const { name, handler, payload, queueName, priority, maxRetries, timeout, tags, templateName, consensus } = req.body;
 
-    if (!name || !handler) {
+    // If a template is named, apply it for the handler/payload/priority.
+    let effectiveHandler = handler;
+    let effectivePayload = payload || {};
+    let effectivePriority = priority;
+    if (templateName) {
+      const applied = TaskTemplates.apply(templateName, effectivePayload);
+      effectiveHandler = applied.handler;
+      effectivePayload = applied.payload;
+      effectivePriority = priority ?? applied.priority;
+    }
+
+    if (!name || !effectiveHandler) {
       return res.status(400).json({ error: 'Missing required fields: name, handler' });
     }
 
-    if (!TaskExecutor.hasHandler(handler)) {
-      return res.status(400).json({ error: `Unknown handler: ${handler}` });
+    if (!TaskExecutor.hasHandler(effectiveHandler)) {
+      return res.status(400).json({ error: `Unknown handler: ${effectiveHandler}` });
     }
 
-    const task = await TaskQueue.createTask(name, handler, payload || {}, {
+    if (consensus !== undefined) {
+      const validStrategies = ['majority', 'all', 'weighted'];
+      if (!consensus.strategy || !validStrategies.includes(consensus.strategy)) {
+        return res.status(400).json({ error: `Invalid consensus.strategy. Must be one of: ${validStrategies.join(', ')}` });
+      }
+      if (!Number.isInteger(consensus.workers) || consensus.workers < 2) {
+        return res.status(400).json({ error: 'consensus.workers must be an integer >= 2' });
+      }
+    }
+
+    if (effectivePayload !== undefined && effectivePayload !== null && (typeof effectivePayload !== 'object' || Array.isArray(effectivePayload))) {
+      return res.status(400).json({ error: 'Payload must be a valid object' });
+    }
+
+    const task = await TaskQueue.createTask(name, effectiveHandler, effectivePayload, {
       queueName,
-      priority,
+      priority: effectivePriority,
       maxRetries,
       timeout,
       tags,
+      consensus,
     });
 
     res.status(201).json(task);
   } catch (error: any) {
+    if (error instanceof DependencyCycleError) {
+      return res.status(400).json({ error: error.message, cycle: error.cycle });
+    }
     logger.error({ error }, 'Create task error');
-    
+
     if (error instanceof QueueFullError) {
       return res.status(429).json({ error: error.message });
     }
-    
+    if (error.message?.includes('Template') || error.message?.includes('required field')) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/tasks/search', async (req: Request, res: Response) => {
+  try {
+    const { q, limit = '50' } = req.query;
+
+    if (!q || typeof q !== 'string') {
+      return res.status(400).json({ error: 'Query parameter q is required and must be a string' });
+    }
+
+    const results = await TaskQueue.searchTasks(q, parseInt(limit as string));
+    res.json(results);
+  } catch (error: any) {
+    logger.error({ error }, 'Search tasks error');
     res.status(500).json({ error: error.message });
   }
 });
@@ -69,6 +137,15 @@ router.post('/tasks/batch', async (req: Request, res: Response) => {
       if (!TaskExecutor.hasHandler(t.handler)) {
         return res.status(400).json({ error: `Unknown handler at index ${index}: ${t.handler}` });
       }
+      if (t.consensus !== undefined) {
+        const validStrategies = ['majority', 'all', 'weighted'];
+        if (!t.consensus.strategy || !validStrategies.includes(t.consensus.strategy)) {
+          return res.status(400).json({ error: `Invalid consensus.strategy at index ${index}. Must be one of: ${validStrategies.join(', ')}` });
+        }
+        if (!Number.isInteger(t.consensus.workers) || t.consensus.workers < 2) {
+          return res.status(400).json({ error: `consensus.workers at index ${index} must be an integer >= 2` });
+        }
+      }
     }
 
     const created = await TaskQueue.createTasksBatch(
@@ -82,6 +159,7 @@ router.post('/tasks/batch', async (req: Request, res: Response) => {
           maxRetries: t.maxRetries,
           timeout: t.timeout,
           tags: t.tags,
+          consensus: t.consensus,
         },
       }))
     );
@@ -109,12 +187,100 @@ router.get('/tasks/:taskId', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /api/queues/:queueName/tasks
+ * Retrieve tasks from a specific queue with pagination and filtering support.
+ * 
+ * Query parameters:
+ * - limit: number of tasks to return (default: 100)
+ * - offset: number of tasks to skip (default: 0)
+ * - status: comma-separated list of statuses to filter by (e.g., pending,processing)
+ * - priority: comma-separated list of priorities to filter by (e.g., high,critical)
+ * - tags: comma-separated list of tags to filter by. Tasks must match ALL specified tags (AND logic).
+ * - startDate: ISO 8601 date string. Filter tasks created on or after this date.
+ * - endDate: ISO 8601 date string. Filter tasks created on or before this date.
+ * 
+ * Filters are combined using AND logic.
+ */
+router.patch('/tasks/:taskId', async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const { priority, timeout, maxRetries, tags, scheduledFor } = req.body;
+
+    const updated = await TaskQueue.updateTaskFields(taskId, {
+      priority,
+      timeout,
+      maxRetries,
+      tags,
+      scheduledFor: scheduledFor ? new Date(scheduledFor) : undefined,
+    });
+
+    res.json(updated);
+  } catch (error: any) {
+    if (error.message?.includes('not found')) {
+      return res.status(404).json({ error: error.message });
+    }
+    if (error.message?.includes('cannot be modified')) {
+      return res.status(409).json({ error: error.message });
+    }
+    if (error.message?.includes('must be')) {
+      return res.status(400).json({ error: error.message });
+    }
+    logger.error({ error }, 'Update task error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/tasks/:taskId/cancel', async (req: Request, res: Response) => {
+  try {
+    const { taskId } = req.params;
+    const cancelled = await TaskQueue.cancelTask(taskId);
+
+    // Signal any in-flight execution to stop cooperatively.
+    TaskExecutor.cancel(taskId);
+
+    if (!cancelled) {
+      return res.status(409).json({ error: 'Task cannot be cancelled (already finished)' });
+    }
+
+    res.json({ success: true, taskId });
+  } catch (error: any) {
+    if (error.message?.includes('not found')) {
+      return res.status(404).json({ error: error.message });
+    }
+    logger.error({ error }, 'Cancel task error');
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get('/queues/:queueName/tasks', async (req: Request, res: Response) => {
   try {
     const { queueName } = req.params;
-    const { limit = '100', offset = '0' } = req.query;
+    const { limit = '100', offset = '0', status, priority, tags, startDate, endDate } = req.query;
 
-    const tasks = await TaskQueue.getQueueTasks(queueName, parseInt(limit as string), parseInt(offset as string));
+    const filters: any = {};
+    if (status) {
+      filters.status = typeof status === 'string' ? status.split(',') : (status as string[]);
+    }
+    if (priority) {
+      filters.priority = typeof priority === 'string' ? priority.split(',') : (priority as string[]);
+    }
+    if (tags) {
+      filters.tags = typeof tags === 'string' ? tags.split(',') : (tags as string[]);
+    }
+    if (startDate) {
+      filters.startDate = new Date(startDate as string);
+    }
+    if (endDate) {
+      filters.endDate = new Date(endDate as string);
+    }
+
+    const tasks = await TaskQueue.getQueueTasks(
+      queueName,
+      parseInt(limit as string),
+      parseInt(offset as string),
+      filters
+    );
     const stats = await TaskQueue.getQueueStats(queueName);
 
     res.json({ tasks, stats });

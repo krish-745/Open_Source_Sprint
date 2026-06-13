@@ -22,9 +22,32 @@ export interface Task {
   queue: string;
   dependencies: string[]; // Task IDs this task depends on
   scheduledFor?: Date; // For delayed tasks
+  ttl?: number; // Time-to-live in seconds before an unstarted task expires
+  expiresAt?: Date; // Absolute expiry time, derived from ttl at creation
+  callbackUrl?: string; // Optional webhook to POST the result to on completion
+  branches?: TaskBranch[]; // Conditional next-steps evaluated against the result
   recurrence?: RecurrenceRule;
   tags: string[];
   metadata: Record<string, any>;
+  traceId?: string;      // Propagated through the full dependency chain
+  parentSpanId?: string; // spanId of the direct dependency task, for call-tree reconstruction
+  consensus?: ConsensusOptions;
+}
+
+export interface ConsensusOptions {
+  workers: number;
+  strategy: 'all' | 'majority' | 'weighted';
+}
+
+/**
+ * A conditional branch: if the task result matches `condition`, the referenced
+ * next task/template should run. `condition` is matched against the stringified
+ * result; prefix it with `regex:` to match with a regular expression.
+ */
+export interface TaskBranch {
+  condition: string;
+  nextTaskId?: string;
+  nextTemplate?: string;
 }
 
 export type TaskStatus =

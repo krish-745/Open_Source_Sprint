@@ -6,11 +6,11 @@ describe('Issue #12: Task Rate Limiting', () => {
   let client: any;
 
   beforeAll(async () => {
-    client = await initializeRedis('redis://localhost:6379');
+    client = await initializeRedis('redis://localhost:6379/3');
   });
 
   beforeEach(async () => {
-    await client.flushAll();
+    await client.flushDb();
   });
 
   afterAll(async () => {
